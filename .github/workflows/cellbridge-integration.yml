@@ -1,10 +1,8 @@
 name: CellBridge integration
 
-# Builds WopiHost.CellBridge (the open-source MS-FSSHTTP backend) against a pinned checkout of
-# https://github.com/PatrickMatthiesen/cellbridge and runs its tests. cellbridge has no NuGet or
-# container release yet, so the per-PR build compiles WopiHost.CellBridge as a no-op; this lane is
-# where the real thing gets exercised. Once cellbridge publishes packages, this becomes a plain
-# PackageReference in Directory.Packages.props and the lane folds into the regular build.
+# Builds the optional CellBridge adapter using the NuGet versions in Directory.Packages.props
+# and runs its tests. A pinned CellBridge source checkout is still required by the standalone
+# desktop demo projects in the AppHost, so this lane keeps the sibling checkout.
 #
 # Weekly (plus workflow_dispatch) rather than nightly: cellbridge moves fast and is explicitly
 # experimental, so a daily red here would be noise rather than signal.
@@ -13,7 +11,7 @@ on:
   workflow_dispatch:
     inputs:
       cellbridge-ref:
-        description: PatrickMatthiesen/cellbridge git ref to build against (default = the pinned commit)
+        description: CellBridge source ref for the standalone AppHost demo (default = the pinned commit)
         required: false
         default: ''
   schedule:
@@ -28,12 +26,12 @@ concurrency:
   cancel-in-progress: false
 
 env:
-  # Last commit of cellbridge verified against this repository. Bump deliberately.
+  # Source pin for the standalone AppHost demo. Adapter versions are in Directory.Packages.props.
   CELLBRIDGE_PINNED_REF: 10b0f7420332a4d90805124db8a4d48c9125daa4
 
 jobs:
   build:
-    name: Build and test against cellbridge
+    name: Build and test CellBridge integration
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:

@@ -9,6 +9,8 @@
 
   <!-- Production packages — referenced by src/, sample/, infra/, and tests. -->
   <ItemGroup>
+    <PackageVersion Include="CellBridge.AspNetCore" Version="0.1.0-beta.2" />
+    <PackageVersion Include="CellBridge.Storage.InMemory" Version="0.1.0-beta.2" />
     <PackageVersion Include="Microsoft.SourceLink.GitHub" Version="10.0.401" PrivateAssets="All" />
     <PackageVersion Include="System.IO.FileSystem.AccessControl" Version="5.0.0" />
     <PackageVersion Include="Microsoft.IdentityModel.Tokens" Version="8.23.0" />

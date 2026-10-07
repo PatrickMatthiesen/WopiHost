@@ -40,18 +40,15 @@
     <ProjectReference Include="..\WopiHost.Abstractions\WopiHost.Abstractions.csproj" />
   </ItemGroup>
 
-  <!-- cellbridge (https://github.com/PatrickMatthiesen/cellbridge) has no NuGet release yet, so its
-       libraries are consumed as source from a sibling checkout: $(CellBridgeRepoRoot), resolved in the
-       root Directory.Build.props. CellBridge.AspNetCore brings FssHttp, FssHttpB, Storage and
-       Storage.Abstractions transitively. Once the packages are published, replace these two
-       ProjectReferences with PackageReferences (versions in Directory.Packages.props) and drop the
-       $(IncludeCellBridge) gate. -->
+  <!-- Published CellBridge packages; versions are managed in Directory.Packages.props.
+       CellBridge.AspNetCore brings FssHttp, FssHttpB, Storage and Storage.Abstractions transitively.
+       Enable this optional backend with -p:IncludeCellBridge=true. -->
   <ItemGroup Condition="'$(IncludeCellBridge)' == 'true'">
-    <ProjectReference Include="$(CellBridgeRepoRoot)/src/CellBridge.AspNetCore/CellBridge.AspNetCore.csproj" />
-    <ProjectReference Include="$(CellBridgeRepoRoot)/src/CellBridge.Storage.InMemory/CellBridge.Storage.InMemory.csproj" />
+    <PackageReference Include="CellBridge.AspNetCore" />
+    <PackageReference Include="CellBridge.Storage.InMemory" />
   </ItemGroup>
 
-  <!-- Every source file here needs the cellbridge types, so without the checkout the project builds as
+  <!-- Every source file here needs the cellbridge types, so when IncludeCellBridge is false the project builds as
        a no-op (only SDK-generated assembly attributes compile). Consumers reference it conditionally on
        $(IncludeCellBridge), so nothing depends on the empty output. -->
   <PropertyGroup Condition="'$(IncludeCellBridge)' != 'true'">
