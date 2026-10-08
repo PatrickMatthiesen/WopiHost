@@ -1,5 +1,7 @@
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.DependencyInjection.Extensions;
+using CellBridge.AspNetCore;
 using WopiHost.Abstractions;
 
 namespace WopiHost.CellBridge;
@@ -9,6 +11,34 @@ namespace WopiHost.CellBridge;
 /// </summary>
 public static class ServiceCollectionExtensions
 {
+    /// <summary>
+    /// Registers the opt-in shared-authority adapter. First configure AddCellBridge with a
+    /// host-owned policy. TRevisionStore must implement real conditional writes and durable receipts.
+    /// Legacy WOPI mutation routes are disabled rather than bypassing the shared authority.
+    /// </summary>
+    public static IServiceCollection AddCoordinatedCellBridgeProcessor<TRevisionStore>(
+        this IServiceCollection services, IConfiguration configuration)
+        where TRevisionStore : class, IWopiRevisionStore
+    {
+        ArgumentNullException.ThrowIfNull(services);
+        ArgumentNullException.ThrowIfNull(configuration);
+        if (services.Any(d => d.ServiceType == typeof(ICobaltProcessor) || d.ServiceType == typeof(IWopiEditingCoordinator)))
+            throw new InvalidOperationException("Configure exactly one editing backend and shared authority.");
+        if (services.Any(d => d.ServiceType == typeof(TRevisionStore) && d.Lifetime != ServiceLifetime.Singleton))
+            throw new InvalidOperationException("The conditional destination must be a singleton.");
+        services.AddOptions<CoordinatedCellBridgeOptions>()
+            .Bind(configuration.GetSection("Wopi:CellBridge:Coordinated"))
+            .Validate(options => { options.Validate(); return true; })
+            .ValidateOnStart();
+        services.TryAddSingleton<TRevisionStore>();
+        services.AddSingleton<IWopiRevisionStore>(sp => sp.GetRequiredService<TRevisionStore>());
+        services.AddCellBridgeExternalPublishing<WopiRevisionDestination>();
+        services.AddSingleton<CoordinatedCellBridgeProcessor>();
+        services.AddSingleton<ICobaltProcessor>(sp => sp.GetRequiredService<CoordinatedCellBridgeProcessor>());
+        services.AddSingleton<IWopiEditingCoordinator>(sp => sp.GetRequiredService<CoordinatedCellBridgeProcessor>());
+        return services;
+    }
+
     /// <summary>
     /// Registers <see cref="CellBridgeProcessor"/> as the host's <see cref="ICobaltProcessor"/>, binding
     /// <see cref="CellBridgeProcessorOptions"/> from <c>Wopi:CellBridge</c>. Exactly one MS-FSSHTTP

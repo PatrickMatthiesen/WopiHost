@@ -6,6 +6,7 @@ using Microsoft.AspNetCore.Http.HttpResults;
 using Microsoft.AspNetCore.Mvc;
 using Microsoft.AspNetCore.Routing;
 using Microsoft.Extensions.Caching.Memory;
+using Microsoft.Extensions.DependencyInjection;
 using WopiHost.Abstractions;
 using WopiHost.Core.Extensions;
 using WopiHost.Core.Infrastructure;
@@ -75,15 +76,16 @@ internal static class FileEndpoints
         // RequiresWritableStorageEndpointFilter, and DefaultCheckFileInfoBuilder cascades
         // SupportsUpdate=false into UserCanNotWriteRelative=true per
         // https://learn.microsoft.com/microsoft-365/cloud-storage-partner-program/rest/files/putrelativefile.
+        var coordinated = req.Http.RequestServices.GetService<IWopiEditingCoordinator>() is not null;
         var capabilities = new WopiHostCapabilities
         {
             SupportsCobalt = req.CobaltProcessor is not null,
-            SupportsGetLock = req.LockProvider is not null,
-            SupportsLocks = req.LockProvider is not null,
+            SupportsGetLock = coordinated || req.LockProvider is not null,
+            SupportsLocks = coordinated || req.LockProvider is not null,
             SupportsCoauth = req.CobaltProcessor is not null,
-            SupportsUpdate = req.WritableStorage is not null,
-            SupportsRename = req.WritableStorage is not null,
-            SupportsDeleteFile = req.WritableStorage is not null,
+            SupportsUpdate = !coordinated && req.WritableStorage is not null,
+            SupportsRename = !coordinated && req.WritableStorage is not null,
+            SupportsDeleteFile = !coordinated && req.WritableStorage is not null,
             SupportedShareUrlTypes = WopiShareUrlTypes.All,
             SupportsAddActivities = true,
         };

@@ -50,6 +50,45 @@ builder.Services.AddCellBridgeProcessor(builder.Configuration);
 
 When `ICobaltProcessor` is registered, `WopiHost.Core` advertises `SupportsCobalt` / `SupportsCoauth` in `CheckFileInfo` and routes `X-WOPI-Override: COBALT` bodies to it.
 
+## Coordinated host integration
+
+`AddCoordinatedCellBridgeProcessor` is an alternative to the experimental adapter above. It uses CellBridge's shared request processor, protocol store, authorization policy and external publisher. WOPI locks and FSSHTTP leases then use the same document state.
+
+```csharp
+// Keep the host's existing AddWopi, storage and permission-provider setup.
+// Supply a durable CellBridge StorageProvider and the host's document policy.
+builder.Services.AddCellBridge<MyDocumentPolicy>(protocolStorage);
+builder.Services.AddCoordinatedCellBridgeProcessor<MyConditionalFileStore>(
+    builder.Configuration);
+```
+
+`MyDocumentPolicy` implements `ICellBridgeAuthorizationPolicy`. It must revalidate authoritative permissions inside document transitions using immutable host-owned permission snapshots. WOPI's `IWopiPermissionProvider` supplies an additional per-request ceiling. A ceiling cannot grant permission denied by the document policy.
+
+`MyConditionalFileStore` implements `IWopiRevisionStore`. It is a real storage capability, not a wrapper around `OpenWriteAsync`. It must return a coherent file snapshot and revision, and atomically commit new bytes, a never-reused revision token and a durable receipt for the complete delivery fingerprint. Every other destination writer must advance the same revision token. Receipts must survive restart, deletion, recreation and rebinding. The host's read-side WOPI provider must expose this same destination's bytes and revisions. `WopiRevisionDestination` adapts this capability to CellBridge's publishing API.
+
+Configure a stable namespace for resource identity and the public origin:
+
+```json
+{
+  "Wopi": {
+    "CellBridge": {
+      "Coordinated": {
+        "ResourceNamespace": "cde0bd84-29ea-4edb-bfc4-470187995b1e",
+        "WebOrigin": "https://documents.example.com"
+      }
+    }
+  }
+}
+```
+
+Keep the namespace stable across restarts and replicas. SOAP requests must target the authenticated WOPI file route or supply its matching protocol resource GUID. An unknown or different supplied GUID is rejected before import. The adapter derives IDs from the namespace and opaque, case-sensitive file ID. It uses explicit authenticated subjects, with no anonymous fallback.
+
+The packaged publishing worker discovers pending revisions after restart. A lost acknowledgement retries the same operation, and a remote revision conflict keeps both the remote bytes and the pending local save. The destination's receipt makes duplicate delivery safe. `AllowVolatileProtocolState=true` is available for disposable single-process experiments; it disables restart recovery and is off by default.
+
+The Core lock routes pass the authenticated principal and expected token to the coordinated adapter. Acquire, refresh, release and replace are atomic. Tokens use ordinal comparison. An active WOPI lock excludes FSSHTTP leases and saves, and an active FSSHTTP lease excludes WOPI acquisition. Foreign protocol lock tokens are not exposed as WOPI tokens.
+
+With this mode registered, `PutFile`, relative overwrites, rename, delete and container mutation routes return 501. `CheckFileInfo` does not advertise those file mutations. There is no fallback to an unconditional write. CellBridge beta.2 has no supported whole-file preparation API for constructing a replacement graph and history before `SharedDocumentLocks.TryCommitAsync`; those routes need that integration before they can be enabled. The mode covers FSSHTTP processing, publishing and base lock exclusion. It does not establish Office Online Server interoperability or complete WOPI editing support. Direct host mutations outside these routes must obey the same authority.
+
 ## Try cellbridge itself
 
 cellbridge's own demo (desktop Office editing against its document library) runs from the WopiHost AppHost with `AppHost:UseCellBridge=true`: a PostgreSQL container, schema init, a seeded `integration-writer` account (`AppHost:CellBridgeTestPassword`) and the library at `https://localhost:7292/library`. Windows desktop Office must trust the ASP.NET Core dev certificate; see [cellbridge's demo guide](https://github.com/PatrickMatthiesen/cellbridge/blob/main/docs/demo-library.md). This lane demonstrates cellbridge, not WopiHost + cellbridge: nothing Docker-distributable speaks Cobalt over WOPI.

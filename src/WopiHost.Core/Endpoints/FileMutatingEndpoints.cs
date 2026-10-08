@@ -7,6 +7,7 @@ using Microsoft.AspNetCore.Http.HttpResults;
 using Microsoft.AspNetCore.Mvc;
 using Microsoft.AspNetCore.Routing;
 using Microsoft.Extensions.Caching.Memory;
+using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Options;
 using WopiHost.Abstractions;
 using WopiHost.Core.Extensions;
@@ -56,7 +57,8 @@ internal static class FileMutatingEndpoints
         // writes to MemoryCache, not storage). Hoist it onto a sub-group instead of repeating
         // the .AddEndpointFilter call eight times.
         var mutating = files.MapGroup("")
-            .AddEndpointFilter<RequiresWritableStorageEndpointFilter>();
+            .AddEndpointFilter<RequiresWritableStorageEndpointFilter>()
+            .AddEndpointFilter<RequiresCoordinatedWriteEndpointFilter>();
 
         mutating.MapMethods("/{id}/contents", ["PUT", "POST"], PutFile)
             .WithSummary("PutFile — writes the request body as the file's contents.")
@@ -495,6 +497,25 @@ internal static class FileMutatingEndpoints
         var file = await req.Storage.GetWopiFile(req.Id, req.CancellationToken).ConfigureAwait(false);
         if (file is null) return TypedResults.NotFound();
         req.Http.Response.Headers[WopiHeaders.ItemVersion] = file.Version;
+        if (req.Http.RequestServices.GetService<IWopiEditingCoordinator>() is { } coordinator)
+        {
+            if (ValidateLockHeaders(req.Http, req.WopiOverrideHeader, req.OldLockIdentifier, req.NewLockIdentifier) is { } error)
+                return error;
+            var operation = req.WopiOverrideHeader switch
+            {
+                WopiFileOperations.GetLock => WopiEditingLockOperation.Get,
+                WopiFileOperations.Unlock => WopiEditingLockOperation.Release,
+                WopiFileOperations.RefreshLock => WopiEditingLockOperation.Refresh,
+                _ => req.OldLockIdentifier is null ? WopiEditingLockOperation.Acquire : WopiEditingLockOperation.Replace
+            };
+            var result = await coordinator.ProcessLockAsync(file, req.Http.User, operation,
+                req.OldLockIdentifier ?? req.NewLockIdentifier,
+                req.OldLockIdentifier is null ? null : req.NewLockIdentifier, req.CancellationToken).ConfigureAwait(false);
+            if (!result.Success) return new WopiLockMismatchResult(result.CurrentLock);
+            if (operation == WopiEditingLockOperation.Get)
+                req.Http.Response.Headers[WopiHeaders.Lock] = result.CurrentLock ?? string.Empty;
+            return TypedResults.Ok();
+        }
         return await ProcessLockCore(req).ConfigureAwait(false);
     }
 
