@@ -1,0 +1,60 @@
+name: Coordinated CellBridge PutFile
+
+on:
+  pull_request:
+    paths:
+      - 'src/WopiHost.Abstractions/**'
+      - 'src/WopiHost.Core/**'
+      - 'src/WopiHost.CellBridge/**'
+      - 'test/WopiHost.IntegrationTests/**'
+      - 'Directory.Packages.props'
+      - '.github/workflows/cellbridge-coordinated-putfile.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  http:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    services:
+      postgres:
+        image: postgres:17-alpine
+        env:
+          POSTGRES_PASSWORD: coordinated-test-only
+          POSTGRES_DB: cellbridge
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      WOPI_TEST_POSTGRES: Host=localhost;Port=5432;Database=cellbridge;Username=postgres;Password=coordinated-test-only
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          path: wopihost
+      # The API is not published. Pin its reviewed source dependency as a sibling
+      # so WopiHost's central package management cannot apply to CellBridge.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          repository: PatrickMatthiesen/cellbridge
+          ref: 9a7a2eaaec1a949012992b9c0e7c1eb96922f555
+          path: cellbridge
+      - uses: actions/setup-dotnet@a98b56852c35b8e3190ac28c8c2271da59106c68 # v6.0.0
+        with:
+          global-json-file: wopihost/global.json
+      - name: Build source-enabled HTTP tests
+        working-directory: wopihost
+        run: dotnet build test/WopiHost.IntegrationTests/WopiHost.IntegrationTests.csproj -p:CellBridgeSourceRoot="$GITHUB_WORKSPACE/cellbridge" -p:IncludeCellBridgeDemo=false -m:1
+      - name: Test routed PutFile with PostgreSQL and transactional destination storage
+        working-directory: wopihost
+        run: dotnet artifacts/bin/WopiHost.IntegrationTests/debug/WopiHost.IntegrationTests.dll -class '*CoordinatedPutFileHttpTests' -noLogo -noColor -result-trx "$RUNNER_TEMP/coordinated-putfile.trx"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        if: always()
+        with:
+          name: coordinated-putfile-results
+          path: ${{ runner.temp }}/coordinated-putfile.trx

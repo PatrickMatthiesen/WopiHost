@@ -21,7 +21,18 @@ Office Online Server ──X-WOPI-Override: COBALT──▶ WopiHost.Core (POST 
 
 ## Enable it
 
-The adapter consumes cellbridge's prerelease NuGet packages (`CellBridge.AspNetCore` and `CellBridge.Storage.InMemory`; versions in `Directory.Packages.props`, bump both together) and builds with the rest of the solution — no checkout, no private feed:
+The released dependency baseline is CellBridge `0.1.0-beta.4`. The normal package build supports coordinated FSSHTTP and base locks, while whole-file WOPI saving remains unavailable. Coordinated `PutFile` additionally requires the unreleased `SaveWholeFileAsync` API and an explicit source build. No package publication is part of this change:
+
+```sh
+dotnet build src/WopiHost.CellBridge/WopiHost.CellBridge.csproj \
+  -p:CellBridgeSourceRoot=/absolute/path/to/CellBridge
+```
+
+`CellBridgeSourceRoot` replaces the two package references with source project references and enables the `CELLBRIDGE_WHOLE_FILE_SAVES` compilation flag. Without it, the adapter builds against beta.4 without registering `IWopiCoordinatedFileMutations`. Whole-file requests then return 501 and `CheckFileInfo.SupportsUpdate` stays false. The beta.4 packages do not contain the new API.
+
+Use the same compatible CellBridge version for every writer against the protocol store. Stop older beta.4 hosts before enabling whole-file saves because those writers do not preserve the new durable receipt field. The source-enabled CI workflow pins the implementation dependency; mixed hosting with older writers is unsupported.
+
+Build the package-backed adapter and run its tests with:
 
 ```sh
 dotnet build WOPI.slnx
@@ -87,7 +98,29 @@ The packaged publishing worker discovers pending revisions after restart. A lost
 
 The Core lock routes pass the authenticated principal and expected token to the coordinated adapter. Acquire, refresh, release and replace are atomic. Tokens use ordinal comparison. An active WOPI lock excludes FSSHTTP leases and saves, and an active FSSHTTP lease excludes WOPI acquisition. Foreign protocol lock tokens are not exposed as WOPI tokens.
 
-With this mode registered, `PutFile`, relative overwrites, rename, delete and container mutation routes return 501. `CheckFileInfo` does not advertise those file mutations. There is no fallback to an unconditional write. CellBridge beta.2 has no supported whole-file preparation API for constructing a replacement graph and history before `SharedDocumentLocks.TryCommitAsync`; those routes need that integration before they can be enabled. The mode covers FSSHTTP processing, publishing and base lock exclusion. It does not establish Office Online Server interoperability or complete WOPI editing support. Direct host mutations outside these routes must obey the same authority.
+The source-enabled coordinated adapter implements `IWopiCoordinatedFileMutations`. For `.docx`, `.xlsx` and `.pptx` files, `PUT` and `POST` on `/wopi/files/{id}/contents` call `SaveWholeFileAsync`; they never open a legacy write stream. CellBridge stages and validates the package and graph, then commits the revision, history, receipt and external publication entry under its shared authority. A matching active WOPI lock and its authenticated owner are required for an existing nonempty file. The unlocked create-new case is restricted to a current zero-byte file with no active WOPI or FSSHTTP locks. Permissions, lifecycle and coordination state are checked again at commit. `ReadOnly` removes write access even when `UserCanWrite` is also present.
+
+A successful response waits until the ordered destination queue has acknowledged the accepted revision. `X-WOPI-ItemVersion` is the destination's acknowledged revision, which the host's read provider must expose as well. Delivery attempts are bounded to 16 entries and 30 seconds per request. Transient storage failures during import, save or delivery and still-pending delivery return 503. Destination conflicts and blocked publication return 409 without replacing the remote bytes. A 503 can precede acceptance or follow an uncertain commit; reuse the operation ID to recover its durable receipt. The accepted local revision and its durable queue entry remain available for recovery. Other file formats return 501 and do not advertise update support. Invalid package content in a supported format returns 400; storage or host size limits return 413. Lock conflicts return 409 with only the current WOPI token or an empty token; foreign protocol tokens remain private.
+
+Clients may send the optional WopiHost extension `X-WopiHost-OperationId` as a nonempty GUID in `D` format. Retrying the same operation ID, subject, bytes and lock token reuses its accepted revision and retries its existing publication entry. Reusing an ID with different bytes or lock authority returns 409. Calls without the header receive a new operation identity per request. Ordinary WOPI clients do not need this extension. `X-WOPI-CorrelationId` is not an idempotency key. Completion callbacks are best-effort request hooks and do not replace durable revision receipts or publication work.
+
+Only the selected whole-file endpoint can enter this path. A client cannot enable it by spoofing `X-WOPI-Override`. Registering only `IWopiEditingCoordinator` still leaves whole-file saving unavailable.
+
+The remaining mutation routes return 501 with an `X-WopiHost-MutationFailureReason` explanation:
+
+| Route | Missing coordination |
+| --- | --- |
+| `PUT_RELATIVE`, including non-overwrite creation | Destination namespace reservation, target authorization and lifecycle binding; overwrite also needs target lock authority and revision publication. |
+| `RENAME_FILE` | Atomic catalog name and protocol path updates. |
+| `DELETE` | Authoritative tombstone and publication retirement before destination deletion. |
+| `CREATE_CHILD_FILE` | Atomic namespace reservation, destination creation and protocol binding. |
+| `CREATE_CHILD_CONTAINER` | A shared namespace authority. |
+| `RENAME_CONTAINER` | Atomic subtree path updates. |
+| `DELETE_CONTAINER` | Atomic emptiness and tombstone checks against concurrent creation. |
+
+`CheckFileInfo` advertises whole-file update only when its mutation capability is registered. Rename, delete, file creation and relative writing remain disabled. `CheckContainerInfo` disables every container mutation flag. Direct host mutations outside these routes must obey the same authority. This integration does not establish Office Online Server interoperability or complete WOPI editing support.
+
+There is no production `IWopiRevisionStore` implementation in this repository. Test providers qualify synthetic and transactional test scenarios; they do not qualify a host's production storage. A production host must test real restart recovery, acknowledgement loss, receipt retention and concurrent external writers using its actual backend.
 
 ## Try cellbridge itself
 

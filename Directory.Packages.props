@@ -48,8 +48,8 @@
     <PackageVersion Include="Microsoft.Extensions.Http.Resilience" Version="10.10.0" />
     <!-- WopiHost.CellBridge (open-source MS-FSSHTTP backend). CellBridge.AspNetCore brings FssHttp,
          FssHttpB, Storage and Storage.Abstractions transitively; bump both entries together. -->
-    <PackageVersion Include="CellBridge.AspNetCore" Version="0.1.0-beta.2" />
-    <PackageVersion Include="CellBridge.Storage.InMemory" Version="0.1.0-beta.2" />
+    <PackageVersion Include="CellBridge.AspNetCore" Version="0.1.0-beta.4" />
+    <PackageVersion Include="CellBridge.Storage.InMemory" Version="0.1.0-beta.4" />
   </ItemGroup>
 
   <!--

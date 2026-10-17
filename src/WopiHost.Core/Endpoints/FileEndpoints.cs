@@ -83,7 +83,9 @@ internal static class FileEndpoints
             SupportsGetLock = coordinated || req.LockProvider is not null,
             SupportsLocks = coordinated || req.LockProvider is not null,
             SupportsCoauth = req.CobaltProcessor is not null,
-            SupportsUpdate = !coordinated && req.WritableStorage is not null,
+            SupportsUpdate = coordinated
+                ? req.Http.RequestServices.GetService<IWopiCoordinatedFileMutations>()?.SupportsPutFile(file) == true
+                : req.WritableStorage is not null,
             SupportsRename = !coordinated && req.WritableStorage is not null,
             SupportsDeleteFile = !coordinated && req.WritableStorage is not null,
             SupportedShareUrlTypes = WopiShareUrlTypes.All,
@@ -94,6 +96,17 @@ internal static class FileEndpoints
         try
         {
             checkFileInfo = await req.Builder.BuildAsync(file, req.Http.ToWopiRequestInfo(), capabilities, userInfo, req.CancellationToken).ConfigureAwait(false);
+            if (coordinated)
+            {
+                // A whole-file save capability does not authorize namespace mutations.
+                checkFileInfo.SupportsUpdate = capabilities.SupportsUpdate;
+                checkFileInfo.SupportsRename = false;
+                checkFileInfo.SupportsDeleteFile = false;
+                checkFileInfo.SupportsFileCreation = false;
+                checkFileInfo.UserCanNotWriteRelative = true;
+                checkFileInfo.UserCanRename = false;
+                checkFileInfo.UserCanWrite &= !checkFileInfo.ReadOnly && capabilities.SupportsUpdate;
+            }
         }
         catch (IOException ex) when (ex is FileNotFoundException or DirectoryNotFoundException)
         {

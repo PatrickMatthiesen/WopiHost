@@ -13,6 +13,9 @@ namespace WopiHost.CellBridge;
 
 /// <summary>Opt-in adapter using shared protocol authority and conditional external publishing.</summary>
 public sealed class CoordinatedCellBridgeProcessor : ICobaltProcessor, IWopiEditingCoordinator
+#if CELLBRIDGE_WHOLE_FILE_SAVES
+    , IWopiCoordinatedFileMutations
+#endif
 {
     private readonly CellBridgeDocumentService _documents;
     private readonly CellBridgeRequestProcessor _requests;
@@ -93,6 +96,144 @@ public sealed class CoordinatedCellBridgeProcessor : ICobaltProcessor, IWopiEdit
         return response;
     }
 
+#if CELLBRIDGE_WHOLE_FILE_SAVES
+    private static readonly string[] s_wholeFileExtensions = ["docx", "xlsx", "pptx"];
+
+    public bool SupportsPutFile(IWopiFile file) =>
+        s_wholeFileExtensions.Contains(file.Extension.TrimStart('.'), StringComparer.OrdinalIgnoreCase);
+
+    public async Task<WopiCoordinatedPutFileResult> PutFileAsync(IWopiFile file, ClaimsPrincipal principal,
+        Stream content, Guid operationId, string? lockToken = null, CancellationToken cancellationToken = default)
+    {
+        try
+        {
+            return await PutFileCoreAsync(file, principal, content, operationId, lockToken, cancellationToken).ConfigureAwait(false);
+        }
+        catch (Exception ex) when (ex is FileNotFoundException or DirectoryNotFoundException or KeyNotFoundException)
+        {
+            // The destination or protocol resource can disappear after HTTP lookup.
+            return new(WopiCoordinatedPutFileStatus.Conflict);
+        }
+        catch (Exception ex) when (IsTransientFileFailure(ex) && !cancellationToken.IsCancellationRequested)
+        {
+            // Import and save can fail before publication starts, including after an ambiguous
+            // commit whose receipt lookup is unavailable. The original operation remains retriable.
+            return new(WopiCoordinatedPutFileStatus.Pending);
+        }
+    }
+
+    private static bool IsTransientFileFailure(Exception exception) => exception is TimeoutException ||
+        exception is IOException and not (StorageCorruptionException or FileNotFoundException or DirectoryNotFoundException);
+
+    private async Task<WopiCoordinatedPutFileResult> PutFileCoreAsync(IWopiFile file, ClaimsPrincipal principal,
+        Stream content, Guid operationId, string? lockToken, CancellationToken cancellationToken)
+    {
+        ArgumentNullException.ThrowIfNull(file);
+        ArgumentNullException.ThrowIfNull(content);
+        if (!SupportsPutFile(file)) throw new NotSupportedException("Coordinated whole-file saving supports docx, xlsx and pptx files.");
+        lockToken = string.IsNullOrEmpty(lockToken) ? null : lockToken;
+        if (operationId == Guid.Empty) throw new ArgumentException("A save operation identity is required.", nameof(operationId));
+        var actor = await ActorAsync(file, principal, cancellationToken).ConfigureAwait(false);
+        if (!actor.AccessLimit!.Access.HasFlag(DocumentAccess.Write)) throw new UnauthorizedAccessException();
+        var baseline = await ImportAsync(file, actor, cancellationToken).ConfigureAwait(false);
+        WholeFileSaveResult accepted;
+        try
+        {
+            accepted = await _documents.SaveWholeFileAsync(baseline.ResourceId, content, operationId.ToString("D"),
+                actor, lockToken, cancellationToken).ConfigureAwait(false);
+        }
+        catch (DocumentOperationLockException)
+        {
+            var observed = await ReadLockAsync(baseline.ResourceId, actor, cancellationToken).ConfigureAwait(false);
+            throw new WopiResourceLockedException(file.Identifier, observed.CurrentLock ?? string.Empty);
+        }
+        catch (WholeFileSaveConflictException)
+        {
+            return new(WopiCoordinatedPutFileStatus.Conflict);
+        }
+        catch (InvalidDataException)
+        {
+            return new(WopiCoordinatedPutFileStatus.InvalidContent);
+        }
+        catch (StorageQuotaExceededException)
+        {
+            return new(WopiCoordinatedPutFileStatus.TooLarge);
+        }
+        _worker.Wake();
+        // Drain only the ordered prefix needed for this accepted revision. Publication retries
+        // retain their original fingerprint; no failed request adopts a newer remote baseline.
+        using var timeout = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+        timeout.CancelAfter(TimeSpan.FromSeconds(30));
+        try
+        {
+            for (var attempt = 0; attempt < 16; attempt++)
+            {
+                var current = await _documents.Provider.State.FindByResourceIdAsync(baseline.ResourceId, timeout.Token).ConfigureAwait(false);
+                if (current is null || current.IsDeleted || current.LifecycleGeneration != accepted.Revision.LifecycleGeneration ||
+                    current.Publication is not { } publication || publication.BindingId != baseline.Publication!.BindingId)
+                    return new(WopiCoordinatedPutFileStatus.Conflict, IsReplay: accepted.IsReplay);
+                if (!publication.Pending.Any(r => r.ContentVersion <= accepted.Revision.ContentVersion))
+                {
+                    var verified = await VerifyAcknowledgedDestinationAsync(current, publication, timeout.Token).ConfigureAwait(false);
+                    if (!verified)
+                    {
+                        // A concurrent publisher can advance the next head while the snapshot
+                        // is being read. Retry that newer baseline before declaring a conflict.
+                        var latest = await _documents.Provider.State.FindByResourceIdAsync(baseline.ResourceId, timeout.Token).ConfigureAwait(false);
+                        if (latest is { IsDeleted: false } && latest.LifecycleGeneration == current.LifecycleGeneration &&
+                            latest.Publication is { } advanced && advanced.BindingId == publication.BindingId &&
+                            (advanced.ExpectedRevision != publication.ExpectedRevision || !advanced.Pending.SequenceEqual(publication.Pending)))
+                            continue;
+                    }
+                    return new(verified ? WopiCoordinatedPutFileStatus.Applied : WopiCoordinatedPutFileStatus.Conflict,
+                        verified ? publication.ExpectedRevision : null, accepted.IsReplay);
+                }
+                if (publication.BlockedReason is not null)
+                    return new(WopiCoordinatedPutFileStatus.Conflict, IsReplay: accepted.IsReplay);
+                var delivered = await _publisher.PublishNextAsync(baseline.ResourceId, timeout.Token).ConfigureAwait(false);
+                if (delivered == PublicationAttempt.TransientFailure)
+                    return new(WopiCoordinatedPutFileStatus.Pending, IsReplay: accepted.IsReplay);
+            }
+        }
+        catch (Exception ex) when (ex is FileNotFoundException or DirectoryNotFoundException && !cancellationToken.IsCancellationRequested)
+        {
+            return new(WopiCoordinatedPutFileStatus.Conflict, IsReplay: accepted.IsReplay);
+        }
+        catch (Exception ex) when ((IsTransientFileFailure(ex) || ex is OperationCanceledException) &&
+            !cancellationToken.IsCancellationRequested)
+        {
+            return new(WopiCoordinatedPutFileStatus.Pending, IsReplay: accepted.IsReplay);
+        }
+        return new(WopiCoordinatedPutFileStatus.Pending, IsReplay: accepted.IsReplay);
+    }
+
+    private async Task<bool> VerifyAcknowledgedDestinationAsync(DocumentState current, ExternalPublicationState publication, CancellationToken ct)
+    {
+        // A content no-op creates no delivery entry. Verify the existing baseline as well so
+        // an unrelated remote edit cannot turn an empty queue into a false success.
+        var acknowledged = publication.Pending.IsEmpty ? current.Content : current.Revisions
+            .LastOrDefault(r => r.ContentVersion < publication.Pending[0].ContentVersion)?.Content;
+        if (acknowledged is null) return false;
+        var baseline = await _destination.ReadAsync(publication.Destination, ct).ConfigureAwait(false);
+        await using var source = baseline.Content.ConfigureAwait(false);
+        if (baseline.Revision != publication.ExpectedRevision || baseline.Length != acknowledged.Length ||
+            baseline.Sha256 != acknowledged.Sha256 || baseline.Length > _documents.Provider.Limits.MaxDocumentBytes)
+            return false;
+        using var hash = IncrementalHash.CreateHash(HashAlgorithmName.SHA256);
+        var buffer = new byte[65536];
+        long length = 0;
+        int read;
+        while ((read = await baseline.Content.ReadAsync(buffer, ct).ConfigureAwait(false)) != 0)
+        {
+            if (read > baseline.Length - length) return false;
+            length += read;
+            hash.AppendData(buffer, 0, read);
+        }
+        return length == baseline.Length && Convert.ToHexStringLower(hash.GetHashAndReset()) == baseline.Sha256;
+    }
+
+#endif
+
     public async Task<WopiEditingLockResult> ProcessLockAsync(IWopiFile file, ClaimsPrincipal principal,
         WopiEditingLockOperation operation, string? token, string? replacementToken = null,
         CancellationToken cancellationToken = default)
@@ -139,7 +280,8 @@ public sealed class CoordinatedCellBridgeProcessor : ICobaltProcessor, IWopiEdit
         var name = identity.FindFirst(ClaimTypes.Name)?.Value ?? subject;
         var permission = await _permissions.GetFilePermissionsAsync(principal, file, ct).ConfigureAwait(false);
         var access = DocumentAccess.Read;
-        if (permission.HasFlag(WopiFilePermissions.UserCanWrite)) access |= DocumentAccess.Write;
+        if (permission.HasFlag(WopiFilePermissions.UserCanWrite) && !permission.HasFlag(WopiFilePermissions.ReadOnly))
+            access |= DocumentAccess.Write;
         return new(new(subject, name, name)) { AccessLimit = new(ResourceId(file.Identifier), access) };
     }
 

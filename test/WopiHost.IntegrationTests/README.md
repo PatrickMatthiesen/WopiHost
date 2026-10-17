@@ -57,3 +57,23 @@ The Docker-backed tests use xUnit v3's built-in `Assert.SkipUnless(...)` to mark
 ```
 
 Both factories wire the same WOPI signing secret, so a token minted by the frontend factory validates on the backend factory.
+
+### Coordinated whole-file saves against CellBridge source
+
+The new whole-file API is available through an explicit source build until a package includes it:
+
+```sh
+dotnet build test/WopiHost.IntegrationTests/WopiHost.IntegrationTests.csproj -p:CellBridgeSourceRoot=/absolute/path/to/CellBridge
+dotnet artifacts/bin/WopiHost.IntegrationTests/debug/WopiHost.IntegrationTests.dll -class "*CoordinatedPutFileHttpTests"
+```
+
+The suite sends authenticated HTTP requests through the sample backend with the real coordinated
+processor. A test-only SQLite provider commits destination bytes, revision tokens and delivery
+receipts in one on-disk transaction. Direct stream writes throw. Protocol storage defaults to the
+explicitly enabled volatile test mode. Set `WOPI_TEST_POSTGRES` to a disposable PostgreSQL connection
+string to run the same cases with durable protocol state and content. The tests create and drop a
+unique schema per case, so the database account must have schema creation permission.
+
+These tests prove the adapter contract with transactional test storage. They do not qualify the
+bundled FileSystem or Azure providers as `IWopiRevisionStore` implementations and do not prove
+Office Online Server COBALT interoperability.

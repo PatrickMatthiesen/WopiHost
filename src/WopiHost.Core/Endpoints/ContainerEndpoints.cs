@@ -4,6 +4,7 @@ using Microsoft.AspNetCore.Http;
 using Microsoft.AspNetCore.Http.HttpResults;
 using Microsoft.AspNetCore.Mvc;
 using Microsoft.AspNetCore.Routing;
+using Microsoft.Extensions.DependencyInjection;
 using WopiHost.Abstractions;
 using WopiHost.Core.Extensions;
 using WopiHost.Core.Infrastructure;
@@ -58,6 +59,13 @@ internal static class ContainerEndpoints
         var container = await req.Storage.GetWopiContainer(req.Id, req.CancellationToken).ConfigureAwait(false);
         if (container is null) return TypedResults.NotFound();
         var info = await req.Builder.BuildAsync(container, req.Http.User, req.CancellationToken).ConfigureAwait(false);
+        if (req.Http.RequestServices.GetService<IWopiEditingCoordinator>() is not null)
+        {
+            info.UserCanCreateChildContainer = false;
+            info.UserCanCreateChildFile = false;
+            info.UserCanDelete = false;
+            info.UserCanRename = false;
+        }
         return TypedResults.Json(info);
     }
 
