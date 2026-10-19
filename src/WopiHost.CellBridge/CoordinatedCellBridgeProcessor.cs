@@ -240,9 +240,25 @@ public sealed class CoordinatedCellBridgeProcessor : ICobaltProcessor, IWopiEdit
     {
         var actor = await ActorAsync(file, principal, cancellationToken).ConfigureAwait(false);
         if (!actor.AccessLimit!.Access.HasFlag(DocumentAccess.Write)) throw new UnauthorizedAccessException();
-        var state = await ImportAsync(file, actor, cancellationToken).ConfigureAwait(false);
         if (operation == WopiEditingLockOperation.Get)
-            return await ReadLockAsync(state.ResourceId, actor, cancellationToken).ConfigureAwait(false);
+        {
+            // Observing a conflict must not import or bind a missing protocol resource.
+            var id = ResourceId(file.Identifier);
+            var current = await _documents.Provider.State.FindByResourceIdAsync(id, cancellationToken).ConfigureAwait(false);
+            if (current is null) return new(true, null);
+            if (current.Publication is { } bound && bound.Destination != file.Identifier)
+                throw new InvalidOperationException("Destination binding mismatch.");
+            try
+            {
+                return await ReadLockAsync(id, actor, cancellationToken).ConfigureAwait(false);
+            }
+            catch (KeyNotFoundException)
+            {
+                // The resource can be deleted between lookup and the authoritative read.
+                return new(true, null);
+            }
+        }
+        var state = await ImportAsync(file, actor, cancellationToken).ConfigureAwait(false);
         if (string.IsNullOrWhiteSpace(token)) throw new ArgumentException("An explicit lock token is required.", nameof(token));
         var mapped = operation switch
         {

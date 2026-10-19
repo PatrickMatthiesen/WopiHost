@@ -271,7 +271,10 @@ internal static class FileMutatingEndpoints
             case WopiCoordinatedPutFileStatus.Pending:
                 return TypedResults.StatusCode(StatusCodes.Status503ServiceUnavailable);
             case WopiCoordinatedPutFileStatus.Conflict:
-                return new WopiLockMismatchResult(existingLock: null);
+                var coordinator = req.Http.RequestServices.GetRequiredService<IWopiEditingCoordinator>();
+                var observed = await coordinator.ProcessLockAsync(file, req.Http.User, WopiEditingLockOperation.Get,
+                    token: null, cancellationToken: req.CancellationToken).ConfigureAwait(false);
+                return new WopiLockMismatchResult(observed.CurrentLock);
             case WopiCoordinatedPutFileStatus.InvalidContent:
                 return TypedResults.BadRequest();
             case WopiCoordinatedPutFileStatus.TooLarge:

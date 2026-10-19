@@ -19,6 +19,17 @@ namespace WopiHost.IntegrationTests;
 public sealed class CoordinatedPutFileHttpTests
 {
     [Fact]
+    public async Task GetLockBeforeEditingDoesNotImportTheDocument()
+    {
+        using var host = await Host.Create();
+        using var response = await host.Request("GET_LOCK", null);
+        Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+        Assert.Equal(string.Empty, Assert.Single(response.Headers.GetValues("X-WOPI-Lock")));
+        Assert.Empty(await host.Storage.State.ListAsync(0, 100));
+        Assert.Equal(0, host.Destination.ReceiptCount());
+    }
+
+    [Fact]
     public async Task PutFilePublishesToTransactionalStorageAndGetReadsTheSameRevision()
     {
         using var host = await Host.Create();
@@ -108,8 +119,11 @@ public sealed class CoordinatedPutFileHttpTests
         var operation = Guid.NewGuid();
         using var first = await host.Put(Package("first"), "held", operation);
         Assert.Equal(HttpStatusCode.OK, first.StatusCode);
+        using var replacement = await host.Request("LOCK", "current", oldLock: "held");
+        Assert.Equal(HttpStatusCode.OK, replacement.StatusCode);
         using var changed = await host.Put(Package("different"), "held", operation);
         Assert.Equal(HttpStatusCode.Conflict, changed.StatusCode);
+        Assert.Equal("current", Assert.Single(changed.Headers.GetValues("X-WOPI-Lock")));
         Assert.Equal(Package("first"), await host.Read());
         Assert.Equal(1, host.Destination.ReceiptCount());
     }
@@ -161,10 +175,18 @@ public sealed class CoordinatedPutFileHttpTests
         Assert.Equal(0, host.Destination.ReceiptCount());
     }
 
-    [Fact]
-    public async Task ActiveFsshttpLeaseRejectsPutFileWithoutLeakingItsToken()
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task ActiveFsshttpLeaseRejectsPutFileWithoutLeakingItsToken(bool changedRetry)
     {
         using var host = await Host.Create(); await host.Lock("held");
+        var operation = Guid.NewGuid();
+        if (changedRetry)
+        {
+            using var first = await host.Put(Package("first"), "held", operation);
+            Assert.Equal(HttpStatusCode.OK, first.StatusCode);
+        }
         using (var unlock = await host.Request("UNLOCK", "held")) Assert.Equal(HttpStatusCode.OK, unlock.StatusCode);
         var lease = Guid.NewGuid();
         var body = Encoding.UTF8.GetBytes($"""
@@ -174,10 +196,12 @@ public sealed class CoordinatedPutFileHttpTests
         var principal = new System.Security.Claims.ClaimsPrincipal(new System.Security.Claims.ClaimsIdentity([new(System.Security.Claims.ClaimTypes.NameIdentifier, Host.User.Id)], "test"));
         var result = await host.Factory.Services.GetRequiredService<ICobaltProcessor>().ProcessCobalt(file, principal, body);
         Assert.Contains("ErrorCode=\"Success\"", Encoding.UTF8.GetString(result));
-        using var refused = await host.Put(Package("refused"), null);
+        using var refused = await host.Put(Package("refused"), changedRetry ? "held" : null, operation);
         Assert.Equal(HttpStatusCode.Conflict, refused.StatusCode);
+        Assert.Equal(string.Empty, Assert.Single(refused.Headers.GetValues("X-WOPI-Lock")));
         Assert.DoesNotContain(lease.ToString(), string.Join("", refused.Headers.SelectMany(h => h.Value)));
-        Assert.Equal(Package("initial"), await host.Read());
+        Assert.Equal(Package(changedRetry ? "first" : "initial"), await host.Read());
+        Assert.Equal(changedRetry ? 1 : 0, host.Destination.ReceiptCount());
     }
 
     [Fact]
@@ -187,6 +211,7 @@ public sealed class CoordinatedPutFileHttpTests
         host.Destination.RemoteWrite(Package("remote"));
         using var response = await host.Put(Package("local"), "held");
         Assert.Equal(HttpStatusCode.Conflict, response.StatusCode);
+        Assert.Equal("held", Assert.Single(response.Headers.GetValues("X-WOPI-Lock")));
         Assert.Equal(Package("remote"), await host.Read());
         var state = await host.State();
         Assert.Equal(2, state.Revisions.Length);
@@ -202,6 +227,7 @@ public sealed class CoordinatedPutFileHttpTests
         host.Destination.RemoteWrite(Package("remote"));
         using var response = await host.Put(Package("initial"), "held");
         Assert.Equal(HttpStatusCode.Conflict, response.StatusCode);
+        Assert.Equal("held", Assert.Single(response.Headers.GetValues("X-WOPI-Lock")));
         Assert.Equal(Package("remote"), await host.Read());
         Assert.Single((await host.State()).Revisions);
         Assert.Equal(0, host.Destination.ReceiptCount());
