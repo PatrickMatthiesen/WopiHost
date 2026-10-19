@@ -262,11 +262,9 @@ internal static class FileMutatingEndpoints
                 if (string.IsNullOrWhiteSpace(result.Version))
                     throw new InvalidOperationException("A coordinated save acknowledgement requires a destination revision.");
                 req.Http.Response.Headers[WopiHeaders.ItemVersion] = result.Version;
-                if (!result.IsReplay)
-                {
-                    var updated = await req.Storage.GetWopiFile(req.Id, req.CancellationToken).ConfigureAwait(false) ?? file;
-                    await InvokePutFileCallbackAsync(req.Http, req.Extensions, updated, req.Editors, req.CancellationToken).ConfigureAwait(false);
-                }
+                // File acceptance can replay even when no request callback has completed.
+                var updated = await req.Storage.GetWopiFile(req.Id, req.CancellationToken).ConfigureAwait(false) ?? file;
+                await InvokePutFileCallbackAsync(req.Http, req.Extensions, updated, req.Editors, operationId, req.CancellationToken).ConfigureAwait(false);
                 return TypedResults.Ok();
             case WopiCoordinatedPutFileStatus.Pending:
                 return TypedResults.StatusCode(StatusCodes.Status503ServiceUnavailable);
@@ -314,7 +312,7 @@ internal static class FileMutatingEndpoints
         {
             httpContext.Response.Headers[WopiHeaders.ItemVersion] = file.Version;
         }
-        await InvokePutFileCallbackAsync(httpContext, extensions, file, editors, cancellationToken).ConfigureAwait(false);
+        await InvokePutFileCallbackAsync(httpContext, extensions, file, editors, operationId: null, cancellationToken).ConfigureAwait(false);
         return TypedResults.Ok();
     }
 
@@ -749,10 +747,11 @@ internal static class FileMutatingEndpoints
         SupportsUpdate = true,
     };
 
-    private static async Task InvokePutFileCallbackAsync(HttpContext httpContext, IWopiHostExtensions extensions, IWopiFile file, string? editorsHeader, CancellationToken ct)
+    private static async Task InvokePutFileCallbackAsync(HttpContext httpContext, IWopiHostExtensions extensions, IWopiFile file, string? editorsHeader, Guid? operationId, CancellationToken ct)
     {
         var editors = ParseEditorsHeader(editorsHeader);
-        await extensions.OnPutFileAsync(new WopiPutFileContext(httpContext.User, file, editors), ct).ConfigureAwait(false);
+        await extensions.OnPutFileAsync(new WopiPutFileContext(httpContext.User, file, editors)
+            { OperationId = operationId }, ct).ConfigureAwait(false);
     }
 
     private static async Task InvokePutRelativeFileCallbackAsync(HttpContext httpContext, IWopiHostExtensions extensions, IWopiFile original, IWopiFile newFile, string? fileConversion, long? declaredSize, CancellationToken ct)

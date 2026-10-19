@@ -276,14 +276,71 @@ public sealed class CoordinatedPutFileHttpTests
         var operation = Guid.NewGuid(); host.Destination.LoseNextAcknowledgement = true;
         using var first = await host.Put(Package("saved"), "held", operation);
         Assert.Equal(HttpStatusCode.ServiceUnavailable, first.StatusCode);
+        Assert.Empty(host.PutFileCallbacks.Calls);
         var reopenedDestination = new SqliteRevisionStore(host.DatabasePath);
         var publisher = new ExternalRevisionPublisher(host.Storage, new WopiRevisionDestination(reopenedDestination));
         await publisher.PublishNextAsync((await host.State()).ResourceId);
-        using var retry = await host.Put(Package("saved"), "held", operation);
+        using var retry = await host.Put(Package("saved"), "held", operation, editors: "alice,bob");
         Assert.Equal(HttpStatusCode.OK, retry.StatusCode);
         Assert.Equal(Package("saved"), await host.Read());
         Assert.Equal(1, reopenedDestination.ReceiptCount());
         Assert.Empty((await host.State()).Publication!.Pending);
+        Assert.Equal(2, (await host.State()).Revisions.Length);
+        var recovered = Assert.Single(host.PutFileCallbacks.Calls);
+        Assert.Equal(operation, recovered.OperationId);
+        Assert.Equal(Package("saved"), recovered.Bytes);
+        Assert.Equal("r1", recovered.Version);
+        Assert.Equal(new[] { "alice", "bob" }, recovered.Editors);
+
+        using var duplicateRetry = await host.Put(Package("saved"), "held", operation);
+        Assert.Equal(HttpStatusCode.OK, duplicateRetry.StatusCode);
+        Assert.Equal(2, host.PutFileCallbacks.Calls.Count);
+        Assert.All(host.PutFileCallbacks.Calls, call =>
+        {
+            Assert.Equal(operation, call.OperationId);
+            Assert.Equal("r1", call.Version);
+            Assert.Equal(Package("saved"), call.Bytes);
+        });
+        Assert.Equal(1, reopenedDestination.ReceiptCount());
+        Assert.Equal(2, (await host.State()).Revisions.Length);
+    }
+
+    [Fact]
+    public async Task SuccessfulPutFileInvokesHostCallbackWithUserFileAndEditors()
+    {
+        using var host = await Host.Create(); await host.Lock("held");
+        var operation = Guid.NewGuid();
+        using var response = await host.Put(Package("saved"), "held", operation, editors: "alice,bob");
+
+        Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+        var callback = Assert.Single(host.PutFileCallbacks.Calls);
+        Assert.Equal(operation, callback.OperationId);
+        Assert.Equal(Host.User.Id, callback.UserId);
+        Assert.Equal(SqliteRevisionStore.FileId, callback.FileIdentifier);
+        Assert.Equal("test.docx", callback.FileName);
+        Assert.Equal(new[] { "alice", "bob" }, callback.Editors);
+        Assert.Equal("r1", callback.Version);
+        Assert.Equal(Package("saved"), callback.Bytes);
+    }
+
+    [Fact]
+    public async Task CallbackFailureReturnsServerErrorAndSameOperationRetryInvokesCallbackAgain()
+    {
+        using var host = await Host.Create(); await host.Lock("held");
+        host.PutFileCallbacks.FailNext = true;
+        var operation = Guid.NewGuid();
+
+        using var failed = await host.Put(Package("saved"), "held", operation);
+        Assert.Equal(HttpStatusCode.InternalServerError, failed.StatusCode);
+        Assert.Equal(Package("saved"), await host.Read());
+        Assert.Equal(1, host.Destination.ReceiptCount());
+        Assert.Equal(2, (await host.State()).Revisions.Length);
+
+        using var retry = await host.Put(Package("saved"), "held", operation);
+        Assert.Equal(HttpStatusCode.OK, retry.StatusCode);
+        Assert.Equal(2, host.PutFileCallbacks.Calls.Count);
+        Assert.All(host.PutFileCallbacks.Calls, call => Assert.Equal(operation, call.OperationId));
+        Assert.Equal(1, host.Destination.ReceiptCount());
         Assert.Equal(2, (await host.State()).Revisions.Length);
     }
 
@@ -419,6 +476,7 @@ public sealed class CoordinatedPutFileHttpTests
         public SqliteRevisionStore Destination { get; private set; } = null!;
         public StorageProvider Storage { get; private set; } = null!;
         public Policy Policy { get; } = new();
+        public RecordingPutFileExtensions PutFileCallbacks { get; } = new();
         public bool PermissionAllowsWrite { get; set; } = true;
         public WopiBackendFactory Factory { get; private set; } = null!;
         public HttpClient Client { get; private set; } = null!;
@@ -448,6 +506,8 @@ public sealed class CoordinatedPutFileHttpTests
                 services.RemoveAll<IWopiStorageProvider>(); services.RemoveAll<IWopiWritableStorageProvider>(); services.RemoveAll<ICobaltProcessor>(); services.RemoveAll<IWopiEditingCoordinator>();
                 services.AddSingleton<IWopiStorageProvider>(host.Destination); services.AddSingleton<IWopiWritableStorageProvider>(host.Destination);
                 services.AddSingleton(host.Destination); services.AddSingleton(host.Policy);
+                services.RemoveAll<IWopiHostExtensions>();
+                services.AddSingleton<IWopiHostExtensions>(host.PutFileCallbacks);
                 services.RemoveAll<IWopiPermissionProvider>();
                 services.AddSingleton<IWopiPermissionProvider>(provider => new LivePermissions(
                     new WopiHost.Core.Security.Authorization.DefaultWopiPermissionProvider(provider.GetRequiredService<Microsoft.Extensions.Options.IOptionsMonitor<WopiHostOptions>>()),
@@ -476,11 +536,12 @@ public sealed class CoordinatedPutFileHttpTests
             if (operation == "RENAME_FILE") request.Headers.Add("X-WOPI-RequestedName", "renamed");
             return await Client.SendAsync(request);
         }
-        public async Task<HttpResponseMessage> Put(byte[] bytes, string? lockToken, Guid? operation = null, string? token = null, CancellationToken cancellationToken = default)
+        public async Task<HttpResponseMessage> Put(byte[] bytes, string? lockToken, Guid? operation = null, string? token = null, string? editors = null, CancellationToken cancellationToken = default)
         {
             using var request = new HttpRequestMessage(HttpMethod.Post, Url("/contents", token)); request.Content = new ByteArrayContent(bytes);
             if (lockToken is not null) request.Headers.Add("X-WOPI-Lock", lockToken);
             request.Headers.Add("X-WopiHost-OperationId", (operation ?? Guid.NewGuid()).ToString("D"));
+            if (editors is not null) request.Headers.Add("X-WOPI-Editors", editors);
             return await Client.SendAsync(request, cancellationToken);
         }
         public Task<byte[]> Read() => Client.GetByteArrayAsync(Url("/contents"));
@@ -496,6 +557,52 @@ public sealed class CoordinatedPutFileHttpTests
             Directory.Delete(_root, recursive: true);
         }
     }
+
+    private sealed class RecordingPutFileExtensions : WopiHostExtensions
+    {
+        private readonly object _gate = new();
+        private readonly List<PutFileCall> _calls = [];
+        private int _failNext;
+
+        public IReadOnlyList<PutFileCall> Calls
+        {
+            get { lock (_gate) return _calls.ToArray(); }
+        }
+
+        public bool FailNext
+        {
+            get => Volatile.Read(ref _failNext) != 0;
+            set => Volatile.Write(ref _failNext, value ? 1 : 0);
+        }
+
+        public override async Task OnPutFileAsync(WopiPutFileContext context, CancellationToken cancellationToken = default)
+        {
+            await using var stream = await context.File.OpenReadAsync(cancellationToken);
+            using var buffer = new MemoryStream();
+            await stream.CopyToAsync(buffer, cancellationToken);
+            var call = new PutFileCall(
+                context.OperationId,
+                context.User?.FindFirst(System.Security.Claims.ClaimTypes.NameIdentifier)?.Value,
+                context.File.Identifier,
+                context.File.Name,
+                context.File.Version,
+                context.Editors.ToArray(),
+                buffer.ToArray());
+            lock (_gate) _calls.Add(call);
+
+            if (Interlocked.Exchange(ref _failNext, 0) != 0)
+                throw new InvalidOperationException("Configured callback failure for integration test.");
+        }
+    }
+
+    private sealed record PutFileCall(
+        Guid? OperationId,
+        string? UserId,
+        string FileIdentifier,
+        string FileName,
+        string? Version,
+        string[] Editors,
+        byte[] Bytes);
 }
 
 #endif

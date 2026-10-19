@@ -55,10 +55,14 @@ public interface IWopiHostExtensions
     Task<WopiCheckEcosystem> OnCheckEcosystemAsync(WopiCheckEcosystemContext context, CancellationToken cancellationToken = default);
 
     /// <summary>
-    /// Hook raised after a successful <c>PutFile</c> write. Receives the updated file plus the
+    /// Hook raised after a <c>PutFile</c> request confirms the stored file. Receives the updated file plus the
     /// user ids parsed from the optional <c>X-WOPI-Editors</c> request header. Use this for
     /// audit trails and last-touch metadata. The default is a no-op.
     /// </summary>
+    /// <remarks>
+    /// Confirmed retries can invoke this hook again. For coordinated saves,
+    /// <see cref="WopiPutFileContext.OperationId"/> identifies the save across retries.
+    /// </remarks>
     Task OnPutFileAsync(WopiPutFileContext context, CancellationToken cancellationToken = default);
 
     /// <summary>
