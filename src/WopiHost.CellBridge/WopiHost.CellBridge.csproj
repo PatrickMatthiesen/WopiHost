@@ -40,10 +40,18 @@
     <ProjectReference Include="..\WopiHost.Abstractions\WopiHost.Abstractions.csproj" />
   </ItemGroup>
 
-  <ItemGroup>
+  <ItemGroup Condition="'$(CellBridgeSourceRoot)' == ''">
     <!-- CellBridge.AspNetCore brings FssHttp, FssHttpB, Storage and Storage.Abstractions transitively. -->
     <PackageReference Include="CellBridge.AspNetCore" />
     <PackageReference Include="CellBridge.Storage.InMemory" />
   </ItemGroup>
 
+  <ItemGroup Condition="'$(CellBridgeSourceRoot)' != ''">
+    <ProjectReference Include="$(CellBridgeSourceRoot)/src/CellBridge.AspNetCore/CellBridge.AspNetCore.csproj" />
+    <ProjectReference Include="$(CellBridgeSourceRoot)/src/CellBridge.Storage.InMemory/CellBridge.Storage.InMemory.csproj" />
+  </ItemGroup>
+
+  <PropertyGroup Condition="'$(CellBridgeSourceRoot)' != ''">
+    <DefineConstants>$(DefineConstants);CELLBRIDGE_WHOLE_FILE_SAVES</DefineConstants>
+  </PropertyGroup>
 </Project>

@@ -1,4 +1,4 @@
-﻿<Project Sdk="Microsoft.NET.Sdk.Web">
+<Project Sdk="Microsoft.NET.Sdk.Web">
 	<PropertyGroup>
 		<TargetFramework>net10.0</TargetFramework>
 		<IsPackable>false</IsPackable>
@@ -14,6 +14,14 @@
 	<ItemGroup>
 		<PackageReference Include="Microsoft.AspNetCore.Mvc.Testing" />
 		<PackageReference Include="Testcontainers" />
+		<PackageReference Include="Microsoft.Data.Sqlite" VersionOverride="10.0.13" />
 	</ItemGroup>
 
+	<ItemGroup>
+        <ProjectReference Include="../../src/WopiHost.CellBridge/WopiHost.CellBridge.csproj" />
+        <ProjectReference Include="$(CellBridgeSourceRoot)/src/CellBridge.Storage.PostgreSql/CellBridge.Storage.PostgreSql.csproj" Condition="'$(CellBridgeSourceRoot)' != ''" />
+    </ItemGroup>
+    <PropertyGroup Condition="'$(CellBridgeSourceRoot)' != ''">
+        <DefineConstants>$(DefineConstants);CELLBRIDGE_WHOLE_FILE_SAVES</DefineConstants>
+    </PropertyGroup>
 </Project>

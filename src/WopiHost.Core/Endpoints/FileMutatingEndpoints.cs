@@ -57,10 +57,11 @@ internal static class FileMutatingEndpoints
         // writes to MemoryCache, not storage). Hoist it onto a sub-group instead of repeating
         // the .AddEndpointFilter call eight times.
         var mutating = files.MapGroup("")
-            .AddEndpointFilter<RequiresWritableStorageEndpointFilter>()
-            .AddEndpointFilter<RequiresCoordinatedWriteEndpointFilter>();
+            .AddEndpointFilter<RequiresCoordinatedWriteEndpointFilter>()
+            .AddEndpointFilter<RequiresWritableStorageEndpointFilter>();
 
         mutating.MapMethods("/{id}/contents", ["PUT", "POST"], PutFile)
+            .WithMetadata(new WopiPutFileMetadata())
             .WithSummary("PutFile — writes the request body as the file's contents.")
             .WithDescription("Spec: https://learn.microsoft.com/microsoft-365/cloud-storage-partner-program/rest/files/putfile. " +
                 "Returns 409 with X-WOPI-Lock on a lock mismatch, 413 when the body exceeds WopiHostOptions.MaxFileSize.")
@@ -200,11 +201,12 @@ internal static class FileMutatingEndpoints
         return TypedResults.Json(new WopiAddActivitiesResponse(responses));
     }
 
-    private static async Task<Results<NotFound, Ok, WopiLockMismatchResult, StatusCodeHttpResult>> PutFile(
+    private static async Task<Results<NotFound, Ok, BadRequest, WopiLockMismatchResult, StatusCodeHttpResult>> PutFile(
         [AsParameters] PutFileRequest req)
     {
-        // RequiresWritableStorageEndpointFilter already short-circuited with 501 if
-        // WritableStorage was missing — the assert is defensive against pipeline misorder.
+        if (req.Http.RequestServices.GetService<IWopiEditingCoordinator>() is not null)
+            return await PutCoordinatedFileAsync(req).ConfigureAwait(false);
+        // RequiresWritableStorageEndpointFilter already checked the legacy provider.
         ArgumentNullException.ThrowIfNull(req.WritableStorage);
         var file = await req.WritableStorage.GetWritableFile(req.Id, req.CancellationToken).ConfigureAwait(false);
         // Exists=false is a stale id→path binding (out-of-band rename/delete) — 404 rather than
@@ -222,6 +224,62 @@ internal static class FileMutatingEndpoints
             return mismatch;
         }
         return await WriteAndAck(req.Http, req.Extensions, file, req.Editors, req.CancellationToken).ConfigureAwait(false);
+    }
+
+    private static async Task<Results<NotFound, Ok, BadRequest, WopiLockMismatchResult, StatusCodeHttpResult>> PutCoordinatedFileAsync(PutFileRequest req)
+    {
+        var mutations = req.Http.RequestServices.GetRequiredService<IWopiCoordinatedFileMutations>();
+        var file = await req.Storage.GetWopiFile(req.Id, req.CancellationToken).ConfigureAwait(false);
+        if (file is null || !file.Exists) return TypedResults.NotFound();
+        if (!mutations.SupportsPutFile(file))
+        {
+            req.Http.Response.Headers[WopiHeaders.MutationFailureReason] = "Coordinated whole-file saving is unavailable for this file format.";
+            return TypedResults.StatusCode(StatusCodes.Status501NotImplemented);
+        }
+        if (CheckMaxFileSize(req.Http, req.Options.Value.MaxFileSize) is { } tooLarge) return tooLarge;
+        if (req.RequestLockId?.Length > WopiLockInfo.MaxLockIdLength ||
+            req.RequestLockId is { Length: > 0 } token && string.IsNullOrWhiteSpace(token)) return TypedResults.BadRequest();
+        var operationId = Guid.NewGuid();
+        if (req.Http.Request.Headers.TryGetValue(WopiHeaders.OperationId, out var supplied) &&
+            (supplied.Count != 1 || !Guid.TryParseExact(supplied[0], "D", out operationId) || operationId == Guid.Empty))
+            return TypedResults.BadRequest();
+        var source = req.Http.Request.Body;
+        var bounded = new MaxFileSizeReadStream(source, req.Options.Value.MaxFileSize ?? long.MaxValue);
+        await using var disposeBounded = bounded.ConfigureAwait(false);
+        WopiCoordinatedPutFileResult result;
+        try
+        {
+            result = await mutations.PutFileAsync(file, req.Http.User, bounded, operationId,
+                req.RequestLockId, req.CancellationToken).ConfigureAwait(false);
+        }
+        catch (BadHttpRequestException ex) when (ex.StatusCode == StatusCodes.Status413PayloadTooLarge)
+        {
+            return TypedResults.StatusCode(StatusCodes.Status413PayloadTooLarge);
+        }
+        switch (result.Status)
+        {
+            case WopiCoordinatedPutFileStatus.Applied:
+                if (string.IsNullOrWhiteSpace(result.Version))
+                    throw new InvalidOperationException("A coordinated save acknowledgement requires a destination revision.");
+                req.Http.Response.Headers[WopiHeaders.ItemVersion] = result.Version;
+                // File acceptance can replay even when no request callback has completed.
+                var updated = await req.Storage.GetWopiFile(req.Id, req.CancellationToken).ConfigureAwait(false) ?? file;
+                await InvokePutFileCallbackAsync(req.Http, req.Extensions, updated, req.Editors, operationId, req.CancellationToken).ConfigureAwait(false);
+                return TypedResults.Ok();
+            case WopiCoordinatedPutFileStatus.Pending:
+                return TypedResults.StatusCode(StatusCodes.Status503ServiceUnavailable);
+            case WopiCoordinatedPutFileStatus.Conflict:
+                var coordinator = req.Http.RequestServices.GetRequiredService<IWopiEditingCoordinator>();
+                var observed = await coordinator.ProcessLockAsync(file, req.Http.User, WopiEditingLockOperation.Get,
+                    token: null, cancellationToken: req.CancellationToken).ConfigureAwait(false);
+                return new WopiLockMismatchResult(observed.CurrentLock);
+            case WopiCoordinatedPutFileStatus.InvalidContent:
+                return TypedResults.BadRequest();
+            case WopiCoordinatedPutFileStatus.TooLarge:
+                return TypedResults.StatusCode(StatusCodes.Status413PayloadTooLarge);
+            default:
+                throw new InvalidOperationException("Unknown coordinated save outcome.");
+        }
     }
 
     // Decides whether a PutFile may proceed, given the file's current lock state. Returns the 409
@@ -254,7 +312,7 @@ internal static class FileMutatingEndpoints
         {
             httpContext.Response.Headers[WopiHeaders.ItemVersion] = file.Version;
         }
-        await InvokePutFileCallbackAsync(httpContext, extensions, file, editors, cancellationToken).ConfigureAwait(false);
+        await InvokePutFileCallbackAsync(httpContext, extensions, file, editors, operationId: null, cancellationToken).ConfigureAwait(false);
         return TypedResults.Ok();
     }
 
@@ -689,10 +747,11 @@ internal static class FileMutatingEndpoints
         SupportsUpdate = true,
     };
 
-    private static async Task InvokePutFileCallbackAsync(HttpContext httpContext, IWopiHostExtensions extensions, IWopiFile file, string? editorsHeader, CancellationToken ct)
+    private static async Task InvokePutFileCallbackAsync(HttpContext httpContext, IWopiHostExtensions extensions, IWopiFile file, string? editorsHeader, Guid? operationId, CancellationToken ct)
     {
         var editors = ParseEditorsHeader(editorsHeader);
-        await extensions.OnPutFileAsync(new WopiPutFileContext(httpContext.User, file, editors), ct).ConfigureAwait(false);
+        await extensions.OnPutFileAsync(new WopiPutFileContext(httpContext.User, file, editors)
+            { OperationId = operationId }, ct).ConfigureAwait(false);
     }
 
     private static async Task InvokePutRelativeFileCallbackAsync(HttpContext httpContext, IWopiHostExtensions extensions, IWopiFile original, IWopiFile newFile, string? fileConversion, long? declaredSize, CancellationToken ct)
@@ -754,6 +813,7 @@ internal sealed record AddActivitiesRequestBody(IReadOnlyList<WopiActivity>? Act
 internal readonly record struct PutFileRequest(
     [FromRoute] string Id,
     HttpContext Http,
+    IWopiStorageProvider Storage,
     [FromServices] IWopiWritableStorageProvider? WritableStorage,
     IWopiHostExtensions Extensions,
     IOptions<WopiHostOptions> Options,

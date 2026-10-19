@@ -15,7 +15,18 @@ internal sealed class RequiresWritableStorageEndpointFilter : IEndpointFilter
     /// <inheritdoc />
     public ValueTask<object?> InvokeAsync(EndpointFilterInvocationContext context, EndpointFilterDelegate next)
     {
-        if (context.HttpContext.RequestServices.GetService<IWopiWritableStorageProvider>() is null)
+        var http = context.HttpContext;
+        if (http.RequestServices.GetService<IWopiEditingCoordinator>() is not null)
+        {
+            var endpoint = http.GetEndpoint();
+            var operations = endpoint?.Metadata.GetMetadata<WopiOverrideMetadata>()?.Values;
+            if ((endpoint?.Metadata.GetMetadata<WopiPutFileMetadata>() is not null &&
+                http.RequestServices.GetService<IWopiCoordinatedFileMutations>() is not null) ||
+                operations is not null && operations.All(op => op is WopiFileOperations.Lock or
+                    WopiFileOperations.Put or WopiFileOperations.Unlock or WopiFileOperations.RefreshLock or WopiFileOperations.GetLock))
+                return next(context);
+        }
+        if (http.RequestServices.GetService<IWopiWritableStorageProvider>() is null)
         {
             return new ValueTask<object?>(TypedResults.StatusCode(StatusCodes.Status501NotImplemented));
         }

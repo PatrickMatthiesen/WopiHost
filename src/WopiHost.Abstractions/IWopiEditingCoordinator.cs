@@ -4,8 +4,8 @@ namespace WopiHost.Abstractions;
 
 /// <summary>Optional shared authority for base WOPI locks and another editing protocol.</summary>
 /// <remarks>
-/// Registration also disables legacy file/container mutations in WopiHost.Core. Those routes
-/// cannot commit through this authority yet. All tokens use ordinal comparison.
+/// Registration disables legacy file/container mutations in WopiHost.Core. Whole-file writes
+/// require the separate IWopiCoordinatedFileMutations capability. All tokens use ordinal comparison.
 /// </remarks>
 public interface IWopiEditingCoordinator
 {

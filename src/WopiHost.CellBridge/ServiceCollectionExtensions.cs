@@ -14,7 +14,7 @@ public static class ServiceCollectionExtensions
     /// <summary>
     /// Registers the opt-in shared-authority adapter. First configure AddCellBridge with a
     /// host-owned policy. TRevisionStore must implement real conditional writes and durable receipts.
-    /// Legacy WOPI mutation routes are disabled rather than bypassing the shared authority.
+    /// Whole-file saves use that authority. Namespace mutation routes remain disabled.
     /// </summary>
     public static IServiceCollection AddCoordinatedCellBridgeProcessor<TRevisionStore>(
         this IServiceCollection services, IConfiguration configuration)
@@ -36,6 +36,9 @@ public static class ServiceCollectionExtensions
         services.AddSingleton<CoordinatedCellBridgeProcessor>();
         services.AddSingleton<ICobaltProcessor>(sp => sp.GetRequiredService<CoordinatedCellBridgeProcessor>());
         services.AddSingleton<IWopiEditingCoordinator>(sp => sp.GetRequiredService<CoordinatedCellBridgeProcessor>());
+#if CELLBRIDGE_WHOLE_FILE_SAVES
+        services.AddSingleton<IWopiCoordinatedFileMutations>(sp => sp.GetRequiredService<CoordinatedCellBridgeProcessor>());
+#endif
         return services;
     }
 

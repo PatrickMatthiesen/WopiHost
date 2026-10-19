@@ -57,3 +57,21 @@ The Docker-backed tests use xUnit v3's built-in `Assert.SkipUnless(...)` to mark
 ```
 
 Both factories wire the same WOPI signing secret, so a token minted by the frontend factory validates on the backend factory.
+
+## Coordinated file-save tests
+
+These tests send authenticated HTTP save requests through the sample host. They check saved-file downloads, permissions, locks, conflicting changes and retries after an interrupted save.
+
+Run from the WopiHost root with a CellBridge checkout that provides `SaveWholeFileAsync`:
+
+```sh
+dotnet restore test/WopiHost.IntegrationTests/WopiHost.IntegrationTests.csproj --configfile nuget.config -p:CellBridgeSourceRoot=/absolute/path/to/CellBridge -p:IncludeCobalt=false
+dotnet build test/WopiHost.IntegrationTests/WopiHost.IntegrationTests.csproj --no-restore -p:CellBridgeSourceRoot=/absolute/path/to/CellBridge -p:IncludeCobalt=false
+dotnet artifacts/bin/WopiHost.IntegrationTests/debug/WopiHost.IntegrationTests.dll -class "*CoordinatedPutFileHttpTests"
+```
+
+Replace the path with your CellBridge checkout, outside the WopiHost directory.
+
+The tests use an on-disk SQLite file store and in-memory CellBridge editing state. To test with persistent editing state too, set `WOPI_TEST_POSTGRES` to the connection string for a disposable PostgreSQL database. The database user needs permission to create and drop schemas; each test creates and removes its own schema.
+
+The SQLite file store is a test fixture. These tests do not exercise the bundled FileSystem or Azure providers, or connect to Office Online Server.

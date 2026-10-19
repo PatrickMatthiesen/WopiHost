@@ -44,8 +44,8 @@ internal static class ContainerMutatingEndpoints
         // The writable-storage gate applies to every mutating container endpoint. Hoist onto a
         // sub-group so each MapPost doesn't have to repeat .AddEndpointFilter.
         var mutating = containers.MapGroup("")
-            .AddEndpointFilter<RequiresWritableStorageEndpointFilter>()
-            .AddEndpointFilter<RequiresCoordinatedWriteEndpointFilter>();
+            .AddEndpointFilter<RequiresCoordinatedWriteEndpointFilter>()
+            .AddEndpointFilter<RequiresWritableStorageEndpointFilter>();
 
         mutating.MapPost("/{id}", CreateChildContainer)
             .WithMetadata(new WopiOverrideMetadata(WopiContainerOperations.CreateChildContainer))

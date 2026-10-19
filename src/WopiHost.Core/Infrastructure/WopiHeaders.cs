@@ -10,6 +10,12 @@ public static class WopiHeaders
     /// </summary>
     public const string WopiOverride = "X-WOPI-Override";
 
+    /// <summary>Optional WopiHost extension: a GUID identifying one retriable coordinated PutFile.</summary>
+    public const string OperationId = "X-WopiHost-OperationId";
+
+    /// <summary>Explains why a mutation route is unavailable under the shared editing authority.</summary>
+    public const string MutationFailureReason = "X-WopiHost-MutationFailureReason";
+
     /// <summary>
     /// A string value identifying the current lock on the file. 
     /// This header must always be included when responding to the request with 409 Conflict. 
