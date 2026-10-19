@@ -47,9 +47,15 @@ jobs:
       - uses: actions/setup-dotnet@a98b56852c35b8e3190ac28c8c2271da59106c68 # v6.0.0
         with:
           global-json-file: wopihost/global.json
+      # Both checkouts name nuget.org differently in their source mappings.
+      # Use one configuration for the complete restore graph so NuGet cannot
+      # discard a source alias while retaining the other checkout's mapping.
+      - name: Restore source-enabled HTTP tests
+        working-directory: wopihost
+        run: dotnet restore test/WopiHost.IntegrationTests/WopiHost.IntegrationTests.csproj --configfile nuget.config -p:CellBridgeSourceRoot="$GITHUB_WORKSPACE/cellbridge" -p:IncludeCellBridgeDemo=false -p:IncludeCobalt=false
       - name: Build source-enabled HTTP tests
         working-directory: wopihost
-        run: dotnet build test/WopiHost.IntegrationTests/WopiHost.IntegrationTests.csproj -p:CellBridgeSourceRoot="$GITHUB_WORKSPACE/cellbridge" -p:IncludeCellBridgeDemo=false -m:1
+        run: dotnet build test/WopiHost.IntegrationTests/WopiHost.IntegrationTests.csproj --no-restore -p:CellBridgeSourceRoot="$GITHUB_WORKSPACE/cellbridge" -p:IncludeCellBridgeDemo=false -p:IncludeCobalt=false -m:1
       - name: Test routed PutFile with PostgreSQL and transactional destination storage
         working-directory: wopihost
         run: dotnet artifacts/bin/WopiHost.IntegrationTests/debug/WopiHost.IntegrationTests.dll -class '*CoordinatedPutFileHttpTests' -noLogo -noColor -result-trx "$RUNNER_TEMP/coordinated-putfile.trx"

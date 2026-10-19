@@ -63,9 +63,12 @@ Both factories wire the same WOPI signing secret, so a token minted by the front
 The new whole-file API is available through an explicit source build until a package includes it:
 
 ```sh
-dotnet build test/WopiHost.IntegrationTests/WopiHost.IntegrationTests.csproj -p:CellBridgeSourceRoot=/absolute/path/to/CellBridge
+dotnet restore test/WopiHost.IntegrationTests/WopiHost.IntegrationTests.csproj --configfile nuget.config -p:CellBridgeSourceRoot=/absolute/path/to/CellBridge -p:IncludeCobalt=false
+dotnet build test/WopiHost.IntegrationTests/WopiHost.IntegrationTests.csproj --no-restore -p:CellBridgeSourceRoot=/absolute/path/to/CellBridge -p:IncludeCobalt=false
 dotnet artifacts/bin/WopiHost.IntegrationTests/debug/WopiHost.IntegrationTests.dll -class "*CoordinatedPutFileHttpTests"
 ```
+
+Run from the WopiHost root. Use its explicit `nuget.config` for the complete restore graph so the two checkouts' different names for nuget.org cannot invalidate package-source mappings on an empty cache.
 
 The suite sends authenticated HTTP requests through the sample backend with the real coordinated
 processor. A test-only SQLite provider commits destination bytes, revision tokens and delivery

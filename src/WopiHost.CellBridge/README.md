@@ -24,9 +24,13 @@ Office Online Server ──X-WOPI-Override: COBALT──▶ WopiHost.Core (POST 
 The released dependency baseline is CellBridge `0.1.0-beta.4`. The normal package build supports coordinated FSSHTTP and base locks, while whole-file WOPI saving remains unavailable. Coordinated `PutFile` additionally requires the unreleased `SaveWholeFileAsync` API and an explicit source build. No package publication is part of this change:
 
 ```sh
-dotnet build src/WopiHost.CellBridge/WopiHost.CellBridge.csproj \
+dotnet restore src/WopiHost.CellBridge/WopiHost.CellBridge.csproj --configfile nuget.config \
+  -p:CellBridgeSourceRoot=/absolute/path/to/CellBridge
+dotnet build src/WopiHost.CellBridge/WopiHost.CellBridge.csproj --no-restore \
   -p:CellBridgeSourceRoot=/absolute/path/to/CellBridge
 ```
+
+Run these commands from the WopiHost root. The explicit configuration gives both source checkouts the same package-source mapping. Their default configurations use different names for nuget.org, which can cause `NU1100` on an empty package cache.
 
 `CellBridgeSourceRoot` replaces the two package references with source project references and enables the `CELLBRIDGE_WHOLE_FILE_SAVES` compilation flag. Without it, the adapter builds against beta.4 without registering `IWopiCoordinatedFileMutations`. Whole-file requests then return 501 and `CheckFileInfo.SupportsUpdate` stays false. The beta.4 packages do not contain the new API.
 
