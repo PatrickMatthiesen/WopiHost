@@ -58,9 +58,11 @@ The Docker-backed tests use xUnit v3's built-in `Assert.SkipUnless(...)` to mark
 
 Both factories wire the same WOPI signing secret, so a token minted by the frontend factory validates on the backend factory.
 
-### Coordinated whole-file saves against CellBridge source
+## Coordinated file-save tests
 
-The new whole-file API is available through an explicit source build until a package includes it:
+These tests send authenticated HTTP save requests through the sample host. They check saved-file downloads, permissions, locks, conflicting changes and retries after an interrupted save.
+
+Run from the WopiHost root with a CellBridge checkout that provides `SaveWholeFileAsync`:
 
 ```sh
 dotnet restore test/WopiHost.IntegrationTests/WopiHost.IntegrationTests.csproj --configfile nuget.config -p:CellBridgeSourceRoot=/absolute/path/to/CellBridge -p:IncludeCobalt=false
@@ -68,15 +70,8 @@ dotnet build test/WopiHost.IntegrationTests/WopiHost.IntegrationTests.csproj --n
 dotnet artifacts/bin/WopiHost.IntegrationTests/debug/WopiHost.IntegrationTests.dll -class "*CoordinatedPutFileHttpTests"
 ```
 
-Run from the WopiHost root. Use its explicit `nuget.config` for the complete restore graph so the two checkouts' different names for nuget.org cannot invalidate package-source mappings on an empty cache.
+Replace the path with your CellBridge checkout, outside the WopiHost directory.
 
-The suite sends authenticated HTTP requests through the sample backend with the real coordinated
-processor. A test-only SQLite provider commits destination bytes, revision tokens and delivery
-receipts in one on-disk transaction. Direct stream writes throw. Protocol storage defaults to the
-explicitly enabled volatile test mode. Set `WOPI_TEST_POSTGRES` to a disposable PostgreSQL connection
-string to run the same cases with durable protocol state and content. The tests create and drop a
-unique schema per case, so the database account must have schema creation permission.
+The tests use an on-disk SQLite file store and in-memory CellBridge editing state. To test with persistent editing state too, set `WOPI_TEST_POSTGRES` to the connection string for a disposable PostgreSQL database. The database user needs permission to create and drop schemas; each test creates and removes its own schema.
 
-These tests prove the adapter contract with transactional test storage. They do not qualify the
-bundled FileSystem or Azure providers as `IWopiRevisionStore` implementations and do not prove
-Office Online Server COBALT interoperability.
+The SQLite file store is a test fixture. These tests do not exercise the bundled FileSystem or Azure providers, or connect to Office Online Server.
