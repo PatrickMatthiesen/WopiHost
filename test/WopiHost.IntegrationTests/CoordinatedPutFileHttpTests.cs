@@ -237,13 +237,17 @@ public sealed class CoordinatedPutFileHttpTests
     public async Task UnknownLengthBodyCannotBypassTheHostFileSizeLimit()
     {
         using var host = await Host.Create(maxFileSize: 8); await host.Lock("held");
+        // Use the server client to keep the request length unknown.
+        using var client = host.Factory.Server.CreateClient();
         using var request = new HttpRequestMessage(HttpMethod.Post, host.Url("/contents"));
         request.Headers.Add("X-WOPI-Lock", "held");
         request.Content = new UnknownLengthContent(Package("oversized"));
-        using var response = await host.Client.SendAsync(request);
+        Assert.Null(request.Content.Headers.ContentLength);
+        using var response = await client.SendAsync(request);
         Assert.Equal(HttpStatusCode.RequestEntityTooLarge, response.StatusCode);
         Assert.Equal(Package("initial"), await host.Read());
         Assert.Equal(0, host.Destination.ReceiptCount());
+        Assert.Single((await host.State()).Revisions);
     }
 
     [Fact]
@@ -258,10 +262,11 @@ public sealed class CoordinatedPutFileHttpTests
             Assert.False(json.RootElement.GetProperty(name).GetBoolean());
     }
 
-    private sealed class UnknownLengthContent(byte[] bytes) : HttpContent
+    private sealed class UnknownLengthContent(byte[] bytes) : StreamContent(new UnknownLengthStream(bytes));
+
+    private sealed class UnknownLengthStream(byte[] bytes) : MemoryStream(bytes, writable: false)
     {
-        protected override Task SerializeToStreamAsync(Stream stream, TransportContext? context) => stream.WriteAsync(bytes).AsTask();
-        protected override bool TryComputeLength(out long length) { length = 0; return false; }
+        public override bool CanSeek => false;
     }
 
     [Fact]

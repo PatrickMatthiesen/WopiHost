@@ -123,7 +123,8 @@ public sealed class CoordinatedCellBridgeProcessor : ICobaltProcessor, IWopiEdit
     }
 
     private static bool IsTransientFileFailure(Exception exception) => exception is TimeoutException ||
-        exception is IOException and not (StorageCorruptionException or FileNotFoundException or DirectoryNotFoundException);
+        exception is IOException and not (Microsoft.AspNetCore.Http.BadHttpRequestException or
+            StorageCorruptionException or FileNotFoundException or DirectoryNotFoundException);
 
     private async Task<WopiCoordinatedPutFileResult> PutFileCoreAsync(IWopiFile file, ClaimsPrincipal principal,
         Stream content, Guid operationId, string? lockToken, CancellationToken cancellationToken)
