@@ -31,18 +31,22 @@ jobs:
           --health-interval 5s
           --health-timeout 5s
           --health-retries 10
+    strategy:
+      matrix:
+        dependency: [packages, source]
     env:
+      CELLBRIDGE_SOURCE_ROOT: ${{ matrix.dependency == 'source' && format('{0}/cellbridge', github.workspace) || '' }}
       WOPI_TEST_POSTGRES: Host=localhost;Port=5432;Database=cellbridge;Username=postgres;Password=coordinated-test-only
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           path: wopihost
-      # The API is not published. Pin its reviewed source dependency as a sibling
-      # so WopiHost's central package management cannot apply to CellBridge.
+      # Pin the matching release source outside WopiHost so its central package
+      # management cannot apply to CellBridge. Test packages and source separately.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           repository: PatrickMatthiesen/cellbridge
-          ref: 9a7a2eaaec1a949012992b9c0e7c1eb96922f555
+          ref: 03b2ee92d28b6dffa283405681323b54c594bd5d
           path: cellbridge
       - uses: actions/setup-dotnet@a98b56852c35b8e3190ac28c8c2271da59106c68 # v6.0.0
         with:
@@ -50,17 +54,17 @@ jobs:
       # Both checkouts name nuget.org differently in their source mappings.
       # Use one configuration for the complete restore graph so NuGet cannot
       # discard a source alias while retaining the other checkout's mapping.
-      - name: Restore source-enabled HTTP tests
+      - name: Restore HTTP tests
         working-directory: wopihost
-        run: dotnet restore test/WopiHost.IntegrationTests/WopiHost.IntegrationTests.csproj --configfile nuget.config -p:CellBridgeSourceRoot="$GITHUB_WORKSPACE/cellbridge" -p:IncludeCellBridgeDemo=false -p:IncludeCobalt=false
-      - name: Build source-enabled HTTP tests
+        run: dotnet restore test/WopiHost.IntegrationTests/WopiHost.IntegrationTests.csproj --configfile nuget.config -p:CellBridgeSourceRoot="$CELLBRIDGE_SOURCE_ROOT" -p:IncludeCellBridgeDemo=false -p:IncludeCobalt=false
+      - name: Build HTTP tests
         working-directory: wopihost
-        run: dotnet build test/WopiHost.IntegrationTests/WopiHost.IntegrationTests.csproj --no-restore -p:CellBridgeSourceRoot="$GITHUB_WORKSPACE/cellbridge" -p:IncludeCellBridgeDemo=false -p:IncludeCobalt=false -m:1
+        run: dotnet build test/WopiHost.IntegrationTests/WopiHost.IntegrationTests.csproj --no-restore -p:CellBridgeSourceRoot="$CELLBRIDGE_SOURCE_ROOT" -p:IncludeCellBridgeDemo=false -p:IncludeCobalt=false -m:1
       - name: Test routed PutFile with PostgreSQL and transactional destination storage
         working-directory: wopihost
         run: dotnet artifacts/bin/WopiHost.IntegrationTests/debug/WopiHost.IntegrationTests.dll -class '*CoordinatedPutFileHttpTests' -noLogo -noColor -result-trx "$RUNNER_TEMP/coordinated-putfile.trx"
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         if: always()
         with:
-          name: coordinated-putfile-results
+          name: coordinated-putfile-results-${{ matrix.dependency }}
           path: ${{ runner.temp }}/coordinated-putfile.trx

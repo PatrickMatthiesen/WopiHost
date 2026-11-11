@@ -7,7 +7,7 @@
 
   <PropertyGroup>
     <OutputType>Exe</OutputType>
-    <TargetFramework>net10.0</TargetFramework>
+    <TargetFramework>net11.0</TargetFramework>
     <ImplicitUsings>enable</ImplicitUsings>
     <IsAspireHost>true</IsAspireHost>
     <UserSecretsId>bd8828e6-c0a3-44b0-af52-51332580a612</UserSecretsId>
@@ -61,8 +61,7 @@
        absent. -->
   <ItemGroup Condition="'$(IncludeCellBridgeDemo)' == 'true'">
     <PackageReference Include="Aspire.Hosting.PostgreSQL" />
-    <ProjectReference Include="$(CellBridgeRepoRoot)/src/CellBridge.Web/CellBridge.Web.csproj" />
-    <ProjectReference Include="$(CellBridgeRepoRoot)/demo/CellBridge.Demo/CellBridge.Demo.csproj" />
+    <ProjectReference Include="$(CellBridgeRepoRoot)/src/CellBridge.WebDemo/CellBridge.WebDemo.csproj" />
     <ProjectReference Include="$(CellBridgeRepoRoot)/tools/CellBridge.Storage.Setup/CellBridge.Storage.Setup.csproj" />
     <ProjectReference Include="$(CellBridgeRepoRoot)/tools/CellBridge.Admin/CellBridge.Admin.csproj" />
   </ItemGroup>

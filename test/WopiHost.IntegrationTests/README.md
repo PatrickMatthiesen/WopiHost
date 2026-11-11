@@ -62,15 +62,15 @@ Both factories wire the same WOPI signing secret, so a token minted by the front
 
 These tests send authenticated HTTP save requests through the sample host. They check saved-file downloads, permissions, locks, conflicting changes and retries after an interrupted save.
 
-Run from the WopiHost root with a CellBridge checkout that provides `SaveWholeFileAsync`:
+Run from the WopiHost root against the published CellBridge beta.6 packages:
 
 ```sh
-dotnet restore test/WopiHost.IntegrationTests/WopiHost.IntegrationTests.csproj --configfile nuget.config -p:CellBridgeSourceRoot=/absolute/path/to/CellBridge -p:IncludeCobalt=false
-dotnet build test/WopiHost.IntegrationTests/WopiHost.IntegrationTests.csproj --no-restore -p:CellBridgeSourceRoot=/absolute/path/to/CellBridge -p:IncludeCobalt=false
+dotnet restore test/WopiHost.IntegrationTests/WopiHost.IntegrationTests.csproj --configfile nuget.config -p:IncludeCobalt=false
+dotnet build test/WopiHost.IntegrationTests/WopiHost.IntegrationTests.csproj --no-restore -p:IncludeCobalt=false
 dotnet artifacts/bin/WopiHost.IntegrationTests/debug/WopiHost.IntegrationTests.dll -class "*CoordinatedPutFileHttpTests"
 ```
 
-Replace the path with your CellBridge checkout, outside the WopiHost directory.
+To repeat against source, add `-p:CellBridgeSourceRoot=/absolute/path/to/CellBridge` to restore and build. Use the beta.6 release checkout (`03b2ee92d28b6dffa283405681323b54c594bd5d`), outside the WopiHost directory. CI runs both dependency modes.
 
 The tests use an on-disk SQLite file store and in-memory CellBridge editing state. To test with persistent editing state too, set `WOPI_TEST_POSTGRES` to the connection string for a disposable PostgreSQL database. The database user needs permission to create and drop schemas; each test creates and removes its own schema.
 

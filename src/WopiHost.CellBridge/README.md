@@ -13,7 +13,7 @@ dotnet build WOPI.slnx
 dotnet test --project test/WopiHost.CellBridge.Tests/WopiHost.CellBridge.Tests.csproj
 ```
 
-Package versions are managed in `Directory.Packages.props`.
+The adapter targets .NET 11 and CellBridge `0.1.0-beta.6`. Package versions are managed in `Directory.Packages.props`.
 
 ## Single-process setup
 
@@ -43,7 +43,7 @@ Register only one editing backend. For persistent editing state and shared WOPI 
 
 This setup uses the same document storage to manage WOPI locks and CellBridge editing. It also retains accepted saves so they can be delivered to your file store after a restart.
 
-Provide a durable CellBridge `StorageProvider`, a document permission policy and a file store implementing `IWopiRevisionStore`:
+Provide a CellBridge `StorageProvider` whose document repository and content store both preserve data after a restart, a document permission policy and a file store implementing `IWopiRevisionStore`:
 
 ```csharp
 // Keep your existing AddWopi, authentication and storage registrations.
@@ -52,7 +52,7 @@ builder.Services.AddCoordinatedCellBridgeProcessor<MyFileStore>(
     builder.Configuration);
 ```
 
-`MyDocumentPolicy` implements `ICellBridgeAuthorizationPolicy` and checks your application's current document permissions when CellBridge changes a document. Both this policy and WOPI's `IWopiPermissionProvider` must allow a write. A read-only WOPI request cannot save changes.
+`MyDocumentPolicy` implements `ICellBridgeAuthorizationPolicy` and checks your application's current document permissions when CellBridge changes a document. Its `Resolve(DocumentAuthorizationView)` method returns an immutable permission snapshot for the selected document and authorization binding. Both this policy and WOPI's `IWopiPermissionProvider` must allow a write. A read-only WOPI request cannot save changes.
 
 `MyFileStore` implements `IWopiRevisionStore`. Its saves must update the file bytes, version and a record of the completed save in a single transaction. That record lets a retry return the original result without writing the file again. Other applications writing to the same file store must also update its version. WopiHost's download provider must read these same bytes and versions.
 
@@ -75,24 +75,24 @@ Configure a stable resource namespace and your public server address:
 
 Choose a namespace GUID for your application and keep it unchanged across restarts and servers. Requests need an authenticated user with a stable ID.
 
+CellBridge beta.6 reads metadata through `StorageProvider.Documents` and reconstructs each accepted package through `StorageProvider.Packages`. Conditional publication retains the operation, lifecycle and destination binding across retries. It never falls back to `IWopiWritableFile.OpenWriteAsync`.
+
 An active WOPI lock prevents CellBridge writes, and an active CellBridge editing lock prevents WOPI from acquiring a conflicting lock. If another application changes a file before a save reaches your file store, the save reports a conflict and preserves the other application's file.
 
 Durable storage is required by default. `AllowVolatileProtocolState=true` permits in-memory storage for disposable tests, but saves waiting for delivery cannot survive a restart in that mode.
 
-### Enable whole-file saves
+### Whole-file saves
 
-Whole-file saving supports Word `.docx`, Excel `.xlsx` and PowerPoint `.pptx` files. Build the adapter with a CellBridge checkout that provides `SaveWholeFileAsync`:
+Whole-file saving supports Word `.docx`, Excel `.xlsx` and PowerPoint `.pptx` files in both the published beta.6 packages and source builds. Coordinated registration always supplies `IWopiCoordinatedFileMutations`.
+
+To test against the exact beta.6 source checkout, pass `CellBridgeSourceRoot`:
 
 ```sh
-dotnet restore src/WopiHost.CellBridge/WopiHost.CellBridge.csproj --configfile nuget.config \
-  -p:CellBridgeSourceRoot=/absolute/path/to/CellBridge
-dotnet build src/WopiHost.CellBridge/WopiHost.CellBridge.csproj --no-restore \
-  -p:CellBridgeSourceRoot=/absolute/path/to/CellBridge
+dotnet test --project test/WopiHost.CellBridge.Tests/WopiHost.CellBridge.Tests.csproj \
+  -p:CellBridgeSourceRoot=/absolute/path/to/CellBridge-beta6
 ```
 
-Run these commands from the WopiHost root and replace the path with your CellBridge checkout. Keep that checkout outside the WopiHost directory.
-
-The bundled CellBridge beta.4 packages support coordinated editing and locks but do not include this whole-file save API. With a package-only build, whole-file saves return HTTP 501 and are not advertised to clients.
+Keep the source checkout outside WopiHost. Omit `CellBridgeSourceRoot` to test the published packages. These are synthetic adapter tests; they do not verify Office Online Server compatibility.
 
 Upgrade all servers sharing CellBridge storage together. Stop servers using older CellBridge versions before enabling whole-file saves.
 

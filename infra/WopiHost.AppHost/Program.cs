@@ -262,7 +262,7 @@ if (builder.Configuration.GetValue("AppHost:IncludeOidcSample", defaultValue: fa
 // while loolwsd is still binding.
 if (useCollabora)
 {
-    var collabora = builder.AddContainer("collabora", "collabora/code", "26.04.4.2.1")
+    var collabora = builder.AddContainer("collabora", "collabora/code", "26.04.5.2.1")
            // host.docker.internal needs an explicit --add-host=host.docker.internal:host-gateway on
            // Linux Docker Engine — Docker Desktop on Mac/Windows wires it implicitly, but the Linux
            // daemon doesn't. Without this, Collabora's WOPI callbacks from inside the container can't
@@ -352,16 +352,10 @@ if (useOnlyOffice)
 }
 
 // ---- cellbridge demo lane ------------------------------------------------------------------
-// PatrickMatthiesen/cellbridge is the open-source MS-FSSHTTP server that WopiHost.CellBridge wraps
-// as an ICobaltProcessor. Its demo targets *desktop* Office (Word/Excel/PowerPoint open the document
-// straight from cellbridge over MS-FSSHTTP + MS-OFBA sign-in), so this lane is cellbridge's own
-// library — PostgreSQL state, schema init, a seeded test account, the host, and the Razor library —
-// not a WOPI lane: no WOPI client here speaks Cobalt, and OOS is not Docker-distributable.
-//
-// Compiled only with IncludeCellBridgeDemo (a sibling cellbridge checkout; see
-// src/WopiHost.CellBridge/README.md) and started only with AppHost:UseCellBridge=true. The library
-// is served at https://localhost:7292/library; sign in as `integration-writer` with the password from
-// AppHost:CellBridgeTestPassword. Desktop Office must trust the ASP.NET Core dev certificate.
+// CellBridge.WebDemo hosts the protocol endpoints and Razor library together. This optional
+// source-built lane uses PostgreSQL, schema setup and a seeded account independently of WOPI.
+// IncludeCellBridgeDemo controls compilation; AppHost:UseCellBridge controls startup.
+// Sign in at https://localhost:7292/library as integration-writer with AppHost:CellBridgeTestPassword.
 #if INCLUDE_CELLBRIDGE_DEMO
 if (builder.Configuration.GetValue("AppHost:UseCellBridge", defaultValue: false))
 {
@@ -392,31 +386,18 @@ if (builder.Configuration.GetValue("AppHost:UseCellBridge", defaultValue: false)
     const string cellBridgePublicOrigin = "https://localhost:7292";
     const string cellBridgeApplicationName = "CellBridge (WopiHost demo)";
 
-    var cellBridgeWeb = builder.AddProject<Projects.CellBridge_Web>("cellbridge-web", launchProfileName: null)
+    ExcludeVsHostingStartups(builder.AddProject<Projects.CellBridge_WebDemo>("cellbridge-web", launchProfileName: null))
         .WithEnvironment("ASPNETCORE_ENVIRONMENT", "Development")
         .WithReference(cellBridgeDatabase)
         .WithEnvironment("Storage__Provider", "PostgreSql")
         .WithEnvironment("Authentication__PublicOrigin", cellBridgePublicOrigin)
         .WithEnvironment("Authentication__ApplicationName", cellBridgeApplicationName)
+        .WithEnvironment("Protocol__PublicOrigin", cellBridgePublicOrigin)
         .WithHttpsEndpoint(port: cellBridgeWebPort, name: "https")
         .WithExternalHttpEndpoints()
         .WithHttpHealthCheck("/health", endpointName: "https")
         .WaitForCompletion(cellBridgeStorageInit)
         .WaitForCompletion(cellBridgeSeedUser);
-
-    // The Razor library runs as its own process; the host reverse-proxies /library to it, so browsers
-    // and Office only ever see the single public origin.
-    var cellBridgeDemo = builder.AddProject<Projects.CellBridge_Demo>("cellbridge-demo", launchProfileName: null)
-        .WithEnvironment("ASPNETCORE_ENVIRONMENT", "Development")
-        .WithReference(cellBridgeDatabase)
-        .WithEnvironment("Authentication__PublicOrigin", cellBridgePublicOrigin)
-        .WithEnvironment("Authentication__ApplicationName", cellBridgeApplicationName)
-        .WithEnvironment("CollabServer__BaseUrl", cellBridgeWeb.GetEndpoint("https"))
-        .WithEnvironment("CollabServer__PublicBaseUrl", cellBridgePublicOrigin)
-        .WithHttpEndpoint(name: "http")
-        .WithHttpHealthCheck("/health", endpointName: "http")
-        .WaitFor(cellBridgeWeb);
-    cellBridgeWeb.WithEnvironment("Demo__BaseUrl", cellBridgeDemo.GetEndpoint("http"));
 }
 #endif
 

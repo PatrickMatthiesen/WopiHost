@@ -2,7 +2,7 @@ name: CellBridge integration
 
 # Builds the AppHost's cellbridge demo lane (AppHost:UseCellBridge) against a pinned source checkout
 # of https://github.com/PatrickMatthiesen/cellbridge. The lane orchestrates cellbridge's own
-# CellBridge.Web / CellBridge.Demo / storage tools, which are not on NuGet, so it is the one part of
+# CellBridge.WebDemo / storage tools, which are not on NuGet, so it is the one part of
 # the integration the per-PR build cannot compile. WopiHost.CellBridge itself consumes the published
 # CellBridge.* packages (Directory.Packages.props) and is built and tested on every PR.
 #
@@ -30,7 +30,7 @@ concurrency:
 env:
   # The cellbridge commit the CellBridge.* package versions in Directory.Packages.props were built
   # from (each nuspec's <repository commit="..."> names it). Move the two together.
-  CELLBRIDGE_PINNED_REF: 4bce2273cd4078d357420d8b4c90c5598047e48b
+  CELLBRIDGE_PINNED_REF: 03b2ee92d28b6dffa283405681323b54c594bd5d
 
 jobs:
   build:
@@ -67,7 +67,7 @@ jobs:
       # build instead of silently compiling the AppHost without the lane.
       - name: Restore
         working-directory: wopihost
-        run: dotnet restore WOPI.slnx -p:IncludeCellBridgeDemo=true
+        run: dotnet restore WOPI.slnx --configfile nuget.config -p:IncludeCellBridgeDemo=true
 
       - name: Build
         working-directory: wopihost

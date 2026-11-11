@@ -81,7 +81,7 @@ public sealed class CoordinatedProcessorTests
         Assert.True((await host.Lock(WopiEditingLockOperation.Acquire, "held")).Success);
         var state = await host.State();
         Assert.True(await host.Services.GetRequiredService<CellBridgeDocumentService>().UpdateAuthorizationAsync(
-            state.ResourceId, state.Security.AuthorizationPolicy, new("test-policy", 1, 2)));
+            state.Head.ResourceId, state.Head.Security.AuthorizationPolicy, new("test-policy", 1, 2)));
         Assert.Null((await host.State()).Coordination.HostLock);
         await Assert.ThrowsAsync<UnauthorizedAccessException>(() => host.Lock(WopiEditingLockOperation.Refresh, "held"));
     }
@@ -92,16 +92,24 @@ public sealed class CoordinatedProcessorTests
         using var host = new Host();
         Assert.True((await host.Lock(WopiEditingLockOperation.Acquire, "held")).Success);
         var before = await host.State();
-        var token = new HostWriteToken(before.ResourceId, before.LifecycleGeneration,
+        var token = new HostWriteToken(before.Head.ResourceId, before.Head.LifecycleGeneration,
             before.Coordination.Generation, "held", "wopi:owner");
         Assert.True((await host.Lock(WopiEditingLockOperation.Refresh, "held")).Success);
         var after = await host.State();
-        var callbackCalled = false;
         var actor = new CellBridgeActor(new("wopi:owner", "owner", "owner"));
+        var publication = new PreparedDocumentPublication(after.Head.ResourceId,
+            new(actor.Identity, after.Head.ResourceId, after.Head.LifecycleGeneration,
+                after.Head.Security.AuthorizationPolicy, DocumentAccess.Read | DocumentAccess.Write)
+                { AuthorityGeneration = after.Head.AuthorityGeneration, StateVersion = after.Head.StateVersion },
+            new(after.Head.LifecycleGeneration, after.Head.AuthorityGeneration, token.CoordinationGeneration,
+                after.Head.StateVersion, after.Head.ContentVersion, []),
+            new(new(after.Head.LifecycleGeneration, SaveOperationFamily.WholeFile, 0, Guid.NewGuid().ToString()),
+                after.Head.Package.Sha256, actor.Identity.Subject, after.Head.ContentVersion, after.Head.LatestRevisionNumber, null, null),
+            []) { HostLockToken = "held" };
         var committed = await new SharedDocumentLocks(host.Services.GetRequiredService<CellBridgeDocumentService>())
-            .TryCommitAsync(token, after.StateVersion, actor, (state, _) => { callbackCalled = true; return state; }, Guid.NewGuid());
+            .TryCommitAsync(token, publication, actor);
         Assert.False(committed);
-        Assert.False(callbackCalled);
+        Assert.Equal(after.Head.ContentVersion, (await host.State()).Head.ContentVersion);
     }
 
     [Fact]
@@ -109,9 +117,7 @@ public sealed class CoordinatedProcessorTests
     {
         using var host = new Host();
         Assert.True((await host.Lock(WopiEditingLockOperation.Acquire, "expired")).Success);
-        var state = await host.State();
-        await host.Storage.State.TransitionAsync(state.ResourceId, (current, now) => new StateTransition<bool>(current with
-        { Coordination = current.Coordination with { HostLock = current.Coordination.HostLock! with { ExpiresUtc = now.AddSeconds(-1) } } }, true));
+        host.Clock.Advance(TimeSpan.FromMinutes(31));
         Assert.Null((await host.Lock(WopiEditingLockOperation.Get)).CurrentLock);
         Assert.False((await host.Lock(WopiEditingLockOperation.Refresh, "expired")).Success);
         Assert.True((await host.Processor.ProcessLockAsync(host.File, Principal("other"), WopiEditingLockOperation.Acquire, "new")).Success);
@@ -127,7 +133,7 @@ public sealed class CoordinatedProcessorTests
         using var host = new Host();
         await Assert.ThrowsAsync<UnauthorizedAccessException>(() => host.Processor.ProcessCobalt(host.File, Principal(),
             Soap("<SubRequest Type=\"WhoAmI\" SubRequestToken=\"1\" />", url, attributes)));
-        Assert.Empty(await host.Storage.State.ListAsync(0, 10));
+        Assert.Empty(await host.Storage.Documents.ListAsync(0, 10));
     }
 
     [Fact]
@@ -135,7 +141,7 @@ public sealed class CoordinatedProcessorTests
     {
         using var host = new Host();
         await Assert.ThrowsAsync<UnauthorizedAccessException>(() => host.Processor.ProcessCobalt(host.File, new ClaimsPrincipal(), QueryBytes()));
-        Assert.Empty(await host.Storage.State.ListAsync(0, 10));
+        Assert.Empty(await host.Storage.Documents.ListAsync(0, 10));
     }
 
     [Fact]
@@ -160,16 +166,16 @@ public sealed class CoordinatedProcessorTests
         await host.Processor.ProcessCobalt(host.File, Principal(), await host.PutAsync(query, "saved"u8.ToArray()));
         Assert.Equal(1, host.Destination.Writes);
         var state = await host.State();
-        var pending = Assert.Single(state.Publication!.Pending);
+        var pending = (await host.Storage.Documents.ReadNextDeliveryAsync(state.Head.ResourceId))!;
         var reconstructed = new ExternalRevisionPublisher(host.Storage, new WopiRevisionDestination(host.Destination));
-        var attempts = await Task.WhenAll(reconstructed.PublishNextAsync(state.ResourceId).AsTask(),
-            reconstructed.PublishNextAsync(state.ResourceId).AsTask());
+        var attempts = await Task.WhenAll(reconstructed.PublishNextAsync(state.Head.ResourceId).AsTask(),
+            reconstructed.PublishNextAsync(state.Head.ResourceId).AsTask());
         Assert.Contains(PublicationAttempt.Delivered, attempts);
-        Assert.Empty((await host.State()).Publication!.Pending);
+        Assert.Null(await host.Storage.Documents.ReadNextDeliveryAsync(state.Head.ResourceId));
         Assert.Equal(1, host.Destination.Writes);
         Assert.Equal("saved", ReadText(host.Destination.Content));
-        await using var bytes = await host.Storage.Content.OpenReadAsync(pending.Content);
-        var changed = new ExternalDeliveryRequest(state.Publication.BindingId, "file-1", "changed-baseline", pending);
+        await using var bytes = await host.Storage.Packages.OpenReadAsync(pending.Revision.Package);
+        var changed = new ExternalDeliveryRequest(pending.Binding.BindingId, "file-1", "changed-baseline", pending.Revision);
         await Assert.ThrowsAsync<InvalidDataException>(() => new WopiRevisionDestination(host.Destination).CompareExchangeAsync(changed, bytes).AsTask());
     }
 
@@ -181,9 +187,9 @@ public sealed class CoordinatedProcessorTests
         host.Destination.RemoteWrite(MinimalDocx("remote"));
         await host.Processor.ProcessCobalt(host.File, Principal(), await host.PutAsync(query, "local"u8.ToArray()));
         Assert.Equal("remote", ReadText(host.Destination.Content));
-        var pending = (await host.State()).Publication!;
-        Assert.Single(pending.Pending);
-        Assert.Equal("DestinationConflict", pending.BlockedReason);
+        var current = (await host.State()).Head;
+        Assert.Equal(1, current.Counters.PendingDeliveries);
+        Assert.Equal("DestinationConflict", current.Delivery!.BlockedReason);
     }
 
     [Fact]
@@ -196,20 +202,85 @@ public sealed class CoordinatedProcessorTests
     [Fact]
     public void DurableMetadataWithVolatileContentIsRejected()
     {
-        var state = A.Fake<IDocumentStateStore>();
+        var state = A.Fake<IDocumentRepository>();
         A.CallTo(() => state.Durable).Returns(true);
         var storage = new StorageProvider(state, new InMemoryContentStore());
-        Assert.True(storage.State.Durable);
+        Assert.True(storage.Documents.Durable);
         Assert.False(storage.Capabilities.Durable);
         using var host = new Host(allowVolatile: false, storage: storage);
         Assert.Throws<InvalidOperationException>(() => host.Services.GetRequiredService<ICobaltProcessor>());
+    }
+
+    [Fact]
+    public async Task WholeFileSaveIsRegisteredAndReplaysWithoutAnotherDestinationWrite()
+    {
+        using var host = new Host();
+        var mutations = host.Services.GetRequiredService<IWopiCoordinatedFileMutations>();
+        Assert.Same(host.Processor, mutations);
+        Assert.True(mutations.SupportsPutFile(host.File));
+        Assert.True((await host.Lock(WopiEditingLockOperation.Acquire, "held")).Success);
+        var operation = Guid.NewGuid();
+        var bytes = MinimalDocx("whole-file");
+        var first = await mutations.PutFileAsync(host.File, Principal(), new MemoryStream(bytes), operation, "held");
+        var replay = await mutations.PutFileAsync(host.File, Principal(), new MemoryStream(bytes), operation, "held");
+        Assert.Equal(WopiCoordinatedPutFileStatus.Applied, first.Status);
+        Assert.Equal(WopiCoordinatedPutFileStatus.Applied, replay.Status);
+        Assert.True(replay.IsReplay);
+        Assert.Equal(first.Version, replay.Version);
+        Assert.Equal(1, host.Destination.Writes);
+        Assert.Equal("whole-file", ReadText(host.Destination.Content));
+        A.CallTo(() => host.File.OpenWriteAsync(A<CancellationToken>._)).MustNotHaveHappened();
+    }
+
+    [Fact]
+    public async Task WholeFileSavePreservesRemoteChangesAndRejectsChangedReplayBytes()
+    {
+        using var host = new Host();
+        Assert.True((await host.Lock(WopiEditingLockOperation.Acquire, "held")).Success);
+        host.Destination.RemoteWrite(MinimalDocx("remote"));
+        var operation = Guid.NewGuid();
+        var first = await host.Processor.PutFileAsync(host.File, Principal(), new MemoryStream(MinimalDocx("local")), operation, "held");
+        var changed = await host.Processor.PutFileAsync(host.File, Principal(), new MemoryStream(MinimalDocx("different")), operation, "held");
+        Assert.Equal(WopiCoordinatedPutFileStatus.Conflict, first.Status);
+        Assert.Equal(WopiCoordinatedPutFileStatus.Conflict, changed.Status);
+        Assert.Equal("remote", ReadText(host.Destination.Content));
+        Assert.Equal(1, (await host.State()).Head.Counters.PendingDeliveries);
+        Assert.Equal(0, host.Destination.Writes);
+        A.CallTo(() => host.File.OpenWriteAsync(A<CancellationToken>._)).MustNotHaveHappened();
+    }
+
+    [Fact]
+    public async Task WholeFileNoOpDoesNotReportSuccessForAnUnrelatedRemoteEdit()
+    {
+        using var host = new Host();
+        var original = host.Destination.Content.ToArray();
+        Assert.True((await host.Lock(WopiEditingLockOperation.Acquire, "held")).Success);
+        host.Destination.RemoteWrite(MinimalDocx("remote"));
+        var result = await host.Processor.PutFileAsync(host.File, Principal(), new MemoryStream(original), Guid.NewGuid(), "held");
+        Assert.Equal(WopiCoordinatedPutFileStatus.Conflict, result.Status);
+        Assert.Equal("remote", ReadText(host.Destination.Content));
+        Assert.Equal(0, host.Destination.Writes);
+    }
+
+    [Fact]
+    public async Task WholeFileSaveRequiresWritePermissionAndAValidPackage()
+    {
+        using var readOnly = new Host(writePermission: false);
+        await Assert.ThrowsAsync<UnauthorizedAccessException>(() => readOnly.Processor.PutFileAsync(
+            readOnly.File, Principal(), new MemoryStream(MinimalDocx("denied")), Guid.NewGuid()));
+        Assert.Empty(await readOnly.Storage.Documents.ListAsync(0, 10));
+        using var host = new Host();
+        Assert.True((await host.Lock(WopiEditingLockOperation.Acquire, "held")).Success);
+        var result = await host.Processor.PutFileAsync(host.File, Principal(), new MemoryStream("invalid"u8.ToArray()), Guid.NewGuid(), "held");
+        Assert.Equal(WopiCoordinatedPutFileStatus.InvalidContent, result.Status);
+        Assert.Equal(0, host.Destination.Writes);
     }
 
     private static ClaimsPrincipal Principal(string id = "owner") => new(new ClaimsIdentity([new(ClaimTypes.NameIdentifier, id)], "test"));
     private static byte[] QueryBytes()
     {
         var request = new FsshttpbCellRequest();
-        request.SubRequests.Add(new(RequestTypes.QueryChanges) { RequestId = 1, Data = new QueryChangesSubRequestData() });
+        request.SubRequests.Add(new(RequestTypes.QueryChanges) { RequestId = 1, Data = new QueryChangesSubRequestData { IncludeStorageManifest = true, IncludeCellChanges = true } });
         return request.ToByteArray();
     }
 
@@ -219,6 +290,8 @@ public sealed class CoordinatedProcessorTests
         static ExGuid Fresh() => new(1, Guid.NewGuid());
         var identity = new StorageManifestBuilder.StableIdentity(Fresh(), Fresh(), Fresh(), Fresh(), Fresh(), Fresh(), Fresh(), cell, Guid.NewGuid());
         var graph = FileContentPartitionBuilder.BuildQueryChangesResponse(1, MinimalDocx(Encoding.UTF8.GetString(content)), identity, data.CellKnowledgeTo + 1);
+        graph.DataElementPackage!.DataElements.Add(query.DataElementPackage!.DataElements.Single(element =>
+            element.DataElementExtendedGuid.Equals(data.StorageIndexExtendedGuid)));
         var request = new FsshttpbCellRequest { DataElementPackage = graph.DataElementPackage };
         request.SubRequests.Add(new(RequestTypes.PutChanges) { RequestId = 2, Data = new PutChangesSubRequestData
         { StorageIndex = ((QueryChangesSubResponseData)graph.SubResponses.Single().Data!).StorageIndexExtendedGuid, ExpectedStorageIndex = data.StorageIndexExtendedGuid } });
@@ -259,14 +332,16 @@ public sealed class CoordinatedProcessorTests
 
     private sealed class Host : IDisposable
     {
-        public StorageProvider Storage { get; } = new(new InMemoryStateStore(), new InMemoryContentStore());
+        public TestClock Clock { get; } = new();
+        public StorageProvider Storage { get; }
         public TestRevisionStore Destination { get; } = new();
         public IWopiWritableFile File { get; } = A.Fake<IWopiWritableFile>();
         public ServiceProvider Services { get; }
         public CoordinatedCellBridgeProcessor Processor => Services.GetRequiredService<CoordinatedCellBridgeProcessor>();
         public Host(bool writePermission = true, bool allowVolatile = true, StorageProvider? storage = null)
         {
-            if (storage is not null) Storage = storage;
+            var content = new InMemoryContentStore();
+            Storage = storage ?? new(new InMemoryDocumentRepository(content, clock: Clock), content);
             A.CallTo(() => File.Identifier).Returns("file-1");
             A.CallTo(() => File.Extension).Returns("docx");
             A.CallTo(() => File.Exists).Returns(true);
@@ -278,19 +353,19 @@ public sealed class CoordinatedProcessorTests
             services.AddSingleton(Destination);
             services.AddSingleton(permissions);
             services.AddCellBridge<TestPolicy>(Storage, requireDurability: false);
-            services.AddCoordinatedCellBridgeProcessor<TestRevisionStore>(new ConfigurationBuilder().AddInMemoryCollection(new Dictionary<string, string?>
-            {
-                ["Wopi:CellBridge:Coordinated:ResourceNamespace"] = "8a811ee1-797b-4e63-8595-dfa410e55819",
-                ["Wopi:CellBridge:Coordinated:WebOrigin"] = "https://wopi.example.test",
-                ["Wopi:CellBridge:Coordinated:SerializationProfile"] = "Current",
-                ["Wopi:CellBridge:Coordinated:AllowVolatileProtocolState"] = allowVolatile.ToString()
-            }).Build());
+            services.AddCoordinatedCellBridgeProcessor<TestRevisionStore>(new ConfigurationBuilder().AddInMemoryCollection(
+            [
+                new("Wopi:CellBridge:Coordinated:ResourceNamespace", "8a811ee1-797b-4e63-8595-dfa410e55819"),
+                new("Wopi:CellBridge:Coordinated:WebOrigin", "https://wopi.example.test"),
+                new("Wopi:CellBridge:Coordinated:SerializationProfile", "Current"),
+                new("Wopi:CellBridge:Coordinated:AllowVolatileProtocolState", allowVolatile.ToString())
+            ]).Build());
             Services = services.BuildServiceProvider();
         }
         public Task<WopiEditingLockResult> Lock(WopiEditingLockOperation operation, string? token = null, string? replacement = null) =>
             Processor.ProcessLockAsync(File, Principal(), operation, token, replacement);
         public async Task<FsshttpbResponse> Query() => FsshttpbResponse.Deserialize(new BinaryReaderEx(await Processor.ProcessCobalt(File, Principal(), QueryBytes())));
-        public async Task<DocumentState> State() => (await Storage.State.FindByResourceIdAsync((await Storage.State.ListAsync(0, 1)).Single().ResourceId))!;
+        public async Task<DocumentControlRead> State() => (await Storage.Documents.ReadControlAsync((await Storage.Documents.ListAsync(0, 1)).Single().ResourceId))!;
         public async Task<byte[]> PutAsync(FsshttpbResponse query, byte[] bytes)
         {
             var partition = (await State()).Partitions.Single(p => p.Kind == 0);
@@ -300,11 +375,18 @@ public sealed class CoordinatedProcessorTests
         public void Dispose() => Services.Dispose();
     }
 
+    private sealed class TestClock : TimeProvider
+    {
+        private DateTimeOffset _now = DateTimeOffset.UtcNow;
+        public override DateTimeOffset GetUtcNow() => _now;
+        public void Advance(TimeSpan elapsed) => _now += elapsed;
+    }
+
     private sealed class TestPolicy : ICellBridgeAuthorizationPolicy
     {
         public string PolicyDomain => "test-policy";
         public DocumentAuthorizationBinding BindNewDocument(Guid resourceId) => new(PolicyDomain, 1, 1);
-        public ICellBridgeAuthorizationSnapshot? Resolve(DocumentState state) => new Snapshot(state.ResourceId, state.Security.AuthorizationPolicy!);
+        public ICellBridgeAuthorizationSnapshot? Resolve(DocumentAuthorizationView state) => new Snapshot(state.ResourceId, state.Security.AuthorizationPolicy!);
         private sealed record Snapshot(Guid ResourceId, DocumentAuthorizationBinding Binding) : ICellBridgeAuthorizationSnapshot
         {
             public DocumentAccess Evaluate(string subject) => Binding.Revision == 1 ? DocumentAccess.Read | DocumentAccess.Write : DocumentAccess.None;
@@ -316,7 +398,7 @@ public sealed class CoordinatedProcessorTests
     private sealed class TestRevisionStore : IWopiRevisionStore
     {
         private readonly object _gate = new();
-        private readonly Dictionary<(Guid, Guid), (WopiRevisionWrite Request, string Result)> _receipts = new();
+        private readonly Dictionary<(Guid, Guid), (WopiRevisionWrite Request, string Result)> _receipts = [];
         private long _version;
         public byte[] Content { get; private set; } = MinimalDocx("initial");
         public int Writes { get; private set; }

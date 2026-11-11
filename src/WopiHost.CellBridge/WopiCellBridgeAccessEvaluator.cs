@@ -10,5 +10,5 @@ namespace WopiHost.CellBridge;
 /// </summary>
 internal sealed class WopiCellBridgeAccessEvaluator : ICellBridgeAccessEvaluator
 {
-    public DocumentAccess Evaluate(CellBridgeActor actor, DocumentState state) => DocumentAccess.Read | DocumentAccess.Write;
+    public DocumentAccess Evaluate(CellBridgeActor actor, DocumentAuthorizationView state) => DocumentAccess.Read | DocumentAccess.Write;
 }

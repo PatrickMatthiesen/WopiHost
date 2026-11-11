@@ -328,6 +328,22 @@ public class CellBridgeProcessorTests
     }
 
     [Fact]
+    public async Task ProcessCobalt_SoapCoordinationDependencyUsesTheEarlierOuterResult()
+    {
+        using var processor = CreateProcessor();
+        var response = await processor.ProcessCobalt(CreateFile(), CreatePrincipal(), SoapEnvelope($"""
+            <SubRequest Type="WhoAmI" SubRequestToken="1" />
+            <SubRequest Type="SchemaLock" SubRequestToken="2" DependsOn="1" DependencyType="OnSuccess">
+              <SubRequestData SchemaLockRequestType="GetLock" SchemaLockID="{Guid.NewGuid():D}" ClientID="{Guid.NewGuid():D}" Timeout="3600" />
+            </SubRequest>
+            <SubRequest Type="LockStatus" SubRequestToken="3" DependsOn="2" DependencyType="OnSuccess" />
+            """));
+        Assert.Equal("Success", (string?)SubResponse(response, 2).Attribute("ErrorCode"));
+        Assert.Equal("Success", (string?)SubResponse(response, 3).Attribute("ErrorCode"));
+        Assert.Equal("1", (string?)SubResponseData(SubResponse(response, 3)).Attribute("LockType"));
+    }
+
+    [Fact]
     public async Task ProcessCobalt_SoapSchemaLock_IsGrantedReportedAndReleased()
     {
         using var processor = CreateProcessor();
@@ -421,6 +437,8 @@ public class CellBridgeProcessorTests
         var graph = FileContentPartitionBuilder.BuildQueryChangesResponse(requestId, content, identity, queried.CellKnowledgeTo + 1);
         var proposed = ((QueryChangesSubResponseData)graph.SubResponses.Single().Data!).StorageIndexExtendedGuid;
 
+        graph.DataElementPackage!.DataElements.Add(query.DataElementPackage!.DataElements.Single(element =>
+            element.DataElementExtendedGuid.Equals(queried.StorageIndexExtendedGuid)));
         var request = new FsshttpbCellRequest { DataElementPackage = graph.DataElementPackage };
         request.SubRequests.Add(new FsshttpbCellSubRequest(RequestTypes.PutChanges)
         {

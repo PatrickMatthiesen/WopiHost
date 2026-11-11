@@ -3,7 +3,7 @@
   <PropertyGroup>
     <Description>WopiHost.CellBridge Class Library</Description>
     <Authors>Petr Svihlik</Authors>
-    <TargetFramework>net10.0</TargetFramework>
+    <TargetFramework>net11.0</TargetFramework>
     <AssemblyName>WopiHost.CellBridge</AssemblyName>
     <PackageId>WopiHost.CellBridge</PackageId>
     <PackageLicenseFile>LICENSE.txt</PackageLicenseFile>
@@ -41,7 +41,7 @@
   </ItemGroup>
 
   <ItemGroup Condition="'$(CellBridgeSourceRoot)' == ''">
-    <!-- CellBridge.AspNetCore brings FssHttp, FssHttpB, Storage and Storage.Abstractions transitively. -->
+    <!-- CellBridge.AspNetCore brings CellBridge core and FssHttpB transitively. -->
     <PackageReference Include="CellBridge.AspNetCore" />
     <PackageReference Include="CellBridge.Storage.InMemory" />
   </ItemGroup>
@@ -51,7 +51,4 @@
     <ProjectReference Include="$(CellBridgeSourceRoot)/src/CellBridge.Storage.InMemory/CellBridge.Storage.InMemory.csproj" />
   </ItemGroup>
 
-  <PropertyGroup Condition="'$(CellBridgeSourceRoot)' != ''">
-    <DefineConstants>$(DefineConstants);CELLBRIDGE_WHOLE_FILE_SAVES</DefineConstants>
-  </PropertyGroup>
 </Project>

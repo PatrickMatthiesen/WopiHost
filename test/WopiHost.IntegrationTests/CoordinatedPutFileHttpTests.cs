@@ -1,4 +1,4 @@
-#if CELLBRIDGE_WHOLE_FILE_SAVES
+using System.Collections.Immutable;
 using System.IO.Compression;
 using System.Net;
 using System.Text;
@@ -25,7 +25,7 @@ public sealed class CoordinatedPutFileHttpTests
         using var response = await host.Request("GET_LOCK", null);
         Assert.Equal(HttpStatusCode.OK, response.StatusCode);
         Assert.Equal(string.Empty, Assert.Single(response.Headers.GetValues("X-WOPI-Lock")));
-        Assert.Empty(await host.Storage.State.ListAsync(0, 100));
+        Assert.Empty(await host.Storage.Documents.ListAsync(0, 100));
         Assert.Equal(0, host.Destination.ReceiptCount());
     }
 
@@ -39,9 +39,9 @@ public sealed class CoordinatedPutFileHttpTests
         Assert.Equal(HttpStatusCode.OK, response.StatusCode);
         Assert.Equal(changed, await host.Read());
         Assert.Equal("r1", Assert.Single(response.Headers.GetValues("X-WOPI-ItemVersion")));
-        var state = await host.State();
-        Assert.Equal(2, state.Revisions.Length);
-        await using var historical = await host.Storage.Content.OpenReadAsync(state.Revisions[0].Content);
+        Assert.Equal(2, (await host.Revisions()).Length);
+        var oldest = (await host.Revisions()).MinBy(revision => revision.RevisionNumber)!;
+        await using var historical = await host.Storage.Packages.OpenReadAsync(oldest.Package);
         using var buffer = new MemoryStream(); await historical.CopyToAsync(buffer);
         Assert.Equal(Package("initial"), buffer.ToArray());
         Assert.Equal(1, host.Destination.ReceiptCount());
@@ -55,7 +55,7 @@ public sealed class CoordinatedPutFileHttpTests
         host.Destination.FailNextRead = true;
         using var unavailable = await host.Put(Package("saved"), null);
         Assert.Equal(HttpStatusCode.ServiceUnavailable, unavailable.StatusCode);
-        Assert.Empty(await host.Storage.State.ListAsync(0, 100));
+        Assert.Empty(await host.Storage.Documents.ListAsync(0, 100));
         Assert.Equal(0, host.Destination.ReceiptCount());
         Assert.Equal(Package("initial"), await host.Read());
         await host.Lock("held");
@@ -63,7 +63,7 @@ public sealed class CoordinatedPutFileHttpTests
         Assert.Equal(HttpStatusCode.OK, retry.StatusCode);
         Assert.Equal(Package("saved"), await host.Read());
         Assert.Equal(1, host.Destination.ReceiptCount());
-        Assert.Equal(2, (await host.State()).Revisions.Length);
+        Assert.Equal(2, (await host.Revisions()).Length);
     }
 
     [Fact]
@@ -73,7 +73,7 @@ public sealed class CoordinatedPutFileHttpTests
         host.Destination.MissingNextRead = true;
         using var response = await host.Put(Package("refused"), "held");
         Assert.Equal(HttpStatusCode.Conflict, response.StatusCode);
-        Assert.Empty(await host.Storage.State.ListAsync(0, 100));
+        Assert.Empty(await host.Storage.Documents.ListAsync(0, 100));
         Assert.Equal(Package("initial"), await host.Read());
         Assert.Equal(0, host.Destination.ReceiptCount());
     }
@@ -89,7 +89,7 @@ public sealed class CoordinatedPutFileHttpTests
         cancellation.Cancel();
         await Assert.ThrowsAnyAsync<OperationCanceledException>(() => pending);
         await host.Destination.ReadCancelled.Task.WaitAsync(TimeSpan.FromSeconds(10));
-        Assert.Empty(await host.Storage.State.ListAsync(0, 100));
+        Assert.Empty(await host.Storage.Documents.ListAsync(0, 100));
         Assert.Equal(0, host.Destination.ReceiptCount());
         Assert.Equal(Package("initial"), await host.Read());
     }
@@ -109,7 +109,7 @@ public sealed class CoordinatedPutFileHttpTests
         Assert.Equal(second.Headers.GetValues("X-WOPI-ItemVersion"), retry.Headers.GetValues("X-WOPI-ItemVersion"));
         Assert.Equal(Package("second"), await host.Read());
         Assert.Equal(2, host.Destination.ReceiptCount());
-        Assert.Equal(3, (await host.State()).Revisions.Length);
+        Assert.Equal(3, (await host.Revisions()).Length);
     }
 
     [Fact]
@@ -136,7 +136,7 @@ public sealed class CoordinatedPutFileHttpTests
         using var host = await Host.Create(); await host.Lock("held");
         if (revokePolicy)
         {
-            var state = await host.State();
+            var state = await host.Head();
             Assert.True(await host.Factory.Services.GetRequiredService<CellBridgeDocumentService>().UpdateAuthorizationAsync(
                 state.ResourceId, state.Security.AuthorizationPolicy, new(host.Policy.PolicyDomain, 1, 2)));
         }
@@ -147,7 +147,7 @@ public sealed class CoordinatedPutFileHttpTests
         Assert.Equal(HttpStatusCode.Forbidden, response.StatusCode);
         Assert.Equal(Package("initial"), await host.Read());
         Assert.Equal(0, host.Destination.ReceiptCount());
-        Assert.Single((await host.State()).Revisions);
+        Assert.Single(await host.Revisions());
     }
 
     [Theory]
@@ -160,9 +160,7 @@ public sealed class CoordinatedPutFileHttpTests
         using var host = await Host.Create(); await host.Lock("held");
         if (kind == "expired")
         {
-            var state = await host.State();
-            await host.Storage.State.TransitionAsync(state.ResourceId, (current, now) => new StateTransition<bool>(current with
-            { Coordination = current.Coordination with { HostLock = current.Coordination.HostLock! with { ExpiresUtc = now.AddSeconds(-1) } } }, true));
+            await host.ExpireHostLock();
         }
         if (kind == "replaced")
         {
@@ -213,10 +211,10 @@ public sealed class CoordinatedPutFileHttpTests
         Assert.Equal(HttpStatusCode.Conflict, response.StatusCode);
         Assert.Equal("held", Assert.Single(response.Headers.GetValues("X-WOPI-Lock")));
         Assert.Equal(Package("remote"), await host.Read());
-        var state = await host.State();
-        Assert.Equal(2, state.Revisions.Length);
-        Assert.Single(state.Publication!.Pending);
-        Assert.Equal("DestinationConflict", state.Publication.BlockedReason);
+        var state = await host.Head();
+        Assert.Equal(2, (await host.Revisions()).Length);
+        Assert.Equal(1, state.Counters.PendingDeliveries);
+        Assert.Equal("DestinationConflict", state.Delivery!.BlockedReason);
         Assert.Equal(0, host.Destination.ReceiptCount());
     }
 
@@ -229,7 +227,7 @@ public sealed class CoordinatedPutFileHttpTests
         Assert.Equal(HttpStatusCode.Conflict, response.StatusCode);
         Assert.Equal("held", Assert.Single(response.Headers.GetValues("X-WOPI-Lock")));
         Assert.Equal(Package("remote"), await host.Read());
-        Assert.Single((await host.State()).Revisions);
+        Assert.Single(await host.Revisions());
         Assert.Equal(0, host.Destination.ReceiptCount());
     }
 
@@ -247,7 +245,7 @@ public sealed class CoordinatedPutFileHttpTests
         Assert.Equal(HttpStatusCode.RequestEntityTooLarge, response.StatusCode);
         Assert.Equal(Package("initial"), await host.Read());
         Assert.Equal(0, host.Destination.ReceiptCount());
-        Assert.Single((await host.State()).Revisions);
+        Assert.Single(await host.Revisions());
     }
 
     [Fact]
@@ -279,13 +277,14 @@ public sealed class CoordinatedPutFileHttpTests
         Assert.Empty(host.PutFileCallbacks.Calls);
         var reopenedDestination = new SqliteRevisionStore(host.DatabasePath);
         var publisher = new ExternalRevisionPublisher(host.Storage, new WopiRevisionDestination(reopenedDestination));
-        await publisher.PublishNextAsync((await host.State()).ResourceId);
+        await publisher.PublishNextAsync((await host.Head()).ResourceId);
         using var retry = await host.Put(Package("saved"), "held", operation, editors: "alice,bob");
         Assert.Equal(HttpStatusCode.OK, retry.StatusCode);
         Assert.Equal(Package("saved"), await host.Read());
         Assert.Equal(1, reopenedDestination.ReceiptCount());
-        Assert.Empty((await host.State()).Publication!.Pending);
-        Assert.Equal(2, (await host.State()).Revisions.Length);
+        Assert.Equal(0, (await host.Head()).Counters.PendingDeliveries);
+        Assert.Null(await host.Storage.Documents.ReadNextDeliveryAsync((await host.Head()).ResourceId));
+        Assert.Equal(2, (await host.Revisions()).Length);
         var recovered = Assert.Single(host.PutFileCallbacks.Calls);
         Assert.Equal(operation, recovered.OperationId);
         Assert.Equal(Package("saved"), recovered.Bytes);
@@ -302,7 +301,7 @@ public sealed class CoordinatedPutFileHttpTests
             Assert.Equal(Package("saved"), call.Bytes);
         });
         Assert.Equal(1, reopenedDestination.ReceiptCount());
-        Assert.Equal(2, (await host.State()).Revisions.Length);
+        Assert.Equal(2, (await host.Revisions()).Length);
     }
 
     [Fact]
@@ -334,14 +333,14 @@ public sealed class CoordinatedPutFileHttpTests
         Assert.Equal(HttpStatusCode.InternalServerError, failed.StatusCode);
         Assert.Equal(Package("saved"), await host.Read());
         Assert.Equal(1, host.Destination.ReceiptCount());
-        Assert.Equal(2, (await host.State()).Revisions.Length);
+        Assert.Equal(2, (await host.Revisions()).Length);
 
         using var retry = await host.Put(Package("saved"), "held", operation);
         Assert.Equal(HttpStatusCode.OK, retry.StatusCode);
         Assert.Equal(2, host.PutFileCallbacks.Calls.Count);
         Assert.All(host.PutFileCallbacks.Calls, call => Assert.Equal(operation, call.OperationId));
         Assert.Equal(1, host.Destination.ReceiptCount());
-        Assert.Equal(2, (await host.State()).Revisions.Length);
+        Assert.Equal(2, (await host.Revisions()).Length);
     }
 
     [Fact]
@@ -354,8 +353,7 @@ public sealed class CoordinatedPutFileHttpTests
         {
             Assert.All(responses, response => Assert.Contains(response.StatusCode, new[] { HttpStatusCode.OK, HttpStatusCode.Conflict }));
             Assert.Contains(responses, response => response.StatusCode == HttpStatusCode.OK);
-            var state = await host.State();
-            Assert.Equal(1 + responses.Count(r => r.StatusCode == HttpStatusCode.OK), state.Revisions.Length);
+            Assert.Equal(1 + responses.Count(r => r.StatusCode == HttpStatusCode.OK), (await host.Revisions()).Length);
             var readBack = await host.Read();
             Assert.Contains(contents, bytes => bytes.SequenceEqual(readBack));
         }
@@ -450,7 +448,7 @@ public sealed class CoordinatedPutFileHttpTests
     {
         public string PolicyDomain => "http-test-policy";
         public DocumentAuthorizationBinding BindNewDocument(Guid resourceId) => new(PolicyDomain, 1, 1);
-        public ICellBridgeAuthorizationSnapshot? Resolve(DocumentState state) => new Snapshot(state.ResourceId, state.Security.AuthorizationPolicy!);
+        public ICellBridgeAuthorizationSnapshot? Resolve(DocumentAuthorizationView state) => new Snapshot(state.ResourceId, state.Security.AuthorizationPolicy!);
         private sealed record Snapshot(Guid ResourceId, DocumentAuthorizationBinding Binding) : ICellBridgeAuthorizationSnapshot
         { public DocumentAccess Evaluate(string subject) => DocumentAccess.Read | (Binding.Revision == 1 ? DocumentAccess.Write : DocumentAccess.None); }
     }
@@ -486,7 +484,11 @@ public sealed class CoordinatedPutFileHttpTests
             var host = new Host(); Directory.CreateDirectory(host._root);
             host.Destination = new(host.DatabasePath, extension); host.Destination.Initialize(Package("initial"));
             host._connectionString = Environment.GetEnvironmentVariable("WOPI_TEST_POSTGRES");
-            if (string.IsNullOrWhiteSpace(host._connectionString)) host.Storage = new(new InMemoryStateStore(), new InMemoryContentStore());
+            if (string.IsNullOrWhiteSpace(host._connectionString))
+            {
+                var content = new InMemoryContentStore();
+                host.Storage = new(new InMemoryDocumentRepository(content), content);
+            }
             else
             {
                 host._schema = "http_" + Guid.NewGuid().ToString("N");
@@ -497,8 +499,9 @@ public sealed class CoordinatedPutFileHttpTests
                 }
                 var settings = new NpgsqlConnectionStringBuilder(host._connectionString) { SearchPath = host._schema };
                 host._source = NpgsqlDataSource.Create(settings.ToString());
-                var state = new PostgreSqlStateStore(host._source); await state.InitializeAsync();
-                host.Storage = new(state, new PostgreSqlContentStore(host._source));
+                var content = new PostgreSqlContentStore(host._source);
+                await new PostgreSqlStorageMigrator(host._source).MigrateAsync();
+                host.Storage = new(new PostgreSqlStateStore(host._source, validationContent: content), content);
             }
             host.Factory = new WopiBackendFactory("coordinated-test-secret-32bytes!!", host._root, services =>
             {
@@ -545,7 +548,29 @@ public sealed class CoordinatedPutFileHttpTests
             return await Client.SendAsync(request, cancellationToken);
         }
         public Task<byte[]> Read() => Client.GetByteArrayAsync(Url("/contents"));
-        public async Task<DocumentState> State() => (await Storage.State.FindByResourceIdAsync((await Storage.State.ListAsync(0, 100)).Single().ResourceId))!;
+        public async Task<DocumentHead> Head() => Assert.Single(await Storage.Documents.ListAsync(0, 100));
+        public async Task<ImmutableArray<DocumentRevisionRecord>> Revisions()
+        {
+            var page = await Storage.Documents.ReadRevisionsAsync((await Head()).ResourceId, 0, 100);
+            Assert.NotNull(page);
+            Assert.Null(page.NextOffset);
+            return page.Revisions;
+        }
+        public async Task ExpireHostLock()
+        {
+            var current = (await Storage.Documents.ReadControlAsync((await Head()).ResourceId))!;
+            var lease = Assert.IsType<HostLease>(current.Coordination.HostLock);
+            var expiresUtc = DateTime.UtcNow.AddSeconds(2);
+            var admission = new DocumentActorAdmission(new(lease.OwnerSubject, User.Id, User.DisplayName),
+                current.Head.ResourceId, current.Head.LifecycleGeneration, current.Head.Security.AuthorizationPolicy,
+                DocumentAccess.Read | DocumentAccess.Write)
+            { StateVersion = current.Head.StateVersion, AuthorityGeneration = current.Head.AuthorityGeneration };
+            var result = await Storage.Documents.ExecuteControlAsync(new DocumentControlCommand.SetHostLease(
+                current.Head.ResourceId, admission, lease with { ExpiresUtc = expiresUtc }, lease.Token));
+            Assert.True(result.Changed);
+            var remaining = expiresUtc - DateTime.UtcNow;
+            if (remaining > TimeSpan.Zero) await Task.Delay(remaining + TimeSpan.FromMilliseconds(50));
+        }
         public void Dispose()
         {
             Client?.Dispose(); Factory?.Dispose(); _source?.Dispose();
@@ -604,5 +629,3 @@ public sealed class CoordinatedPutFileHttpTests
         string[] Editors,
         byte[] Bytes);
 }
-
-#endif

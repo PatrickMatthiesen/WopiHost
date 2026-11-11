@@ -36,9 +36,7 @@ public static class ServiceCollectionExtensions
         services.AddSingleton<CoordinatedCellBridgeProcessor>();
         services.AddSingleton<ICobaltProcessor>(sp => sp.GetRequiredService<CoordinatedCellBridgeProcessor>());
         services.AddSingleton<IWopiEditingCoordinator>(sp => sp.GetRequiredService<CoordinatedCellBridgeProcessor>());
-#if CELLBRIDGE_WHOLE_FILE_SAVES
         services.AddSingleton<IWopiCoordinatedFileMutations>(sp => sp.GetRequiredService<CoordinatedCellBridgeProcessor>());
-#endif
         return services;
     }
 

@@ -12,7 +12,7 @@ public sealed class WopiRevisionDestination(IWopiRevisionStore store) : IExterna
         var revision = request.Revision;
         var result = await store.CompareExchangeAsync(new(request.Destination, request.ExpectedRevision,
             request.BindingId, revision.OperationId, revision.ResourceId, revision.LifecycleGeneration,
-            revision.Sequence, revision.ContentVersion, revision.Content.Length, revision.Content.Sha256),
+            revision.Sequence, revision.ContentVersion, revision.Package.Length, revision.Package.Sha256),
             verifiedContent, cancellationToken).ConfigureAwait(false);
         if (result.Status == WopiRevisionWriteStatus.Applied &&
             (string.IsNullOrWhiteSpace(result.Revision) || result.Revision == request.ExpectedRevision))

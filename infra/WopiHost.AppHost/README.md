@@ -68,8 +68,38 @@ dotnet run --project infra/WopiHost.AppHost -- --AppHost:UseOnlyOffice=false
 | `AppHost:UseRedisLocks` | `true` | `wopi-locks` Redis container; both backends use the distributed lock provider against it. |
 | `AppHost:UseAzureStorage` | `false` | Azurite emulator + `BlobStorage` connection string forwarded to the backends. |
 | `AppHost:IncludeOidcSample` | `false` | The `WopiHost.Web.Oidc` frontend (requires IdP setup — see its README). |
-| `AppHost:UseCellBridge` | `false` | The [cellbridge](https://github.com/PatrickMatthiesen/cellbridge) demo lane: a `cellbridge-storage` PostgreSQL container, schema init, a seeded `integration-writer` account, cellbridge's host at `https://localhost:7292` and its document library at `/library`. Desktop Office (Windows) opens the documents straight from it over MS-FSSHTTP. cellbridge's demo projects are not on NuGet, so the lane builds from a sibling cellbridge source checkout behind `IncludeCellBridgeDemo` (auto-detected; see [src/WopiHost.CellBridge](../../src/WopiHost.CellBridge/README.md)). |
+| `AppHost:UseCellBridge` | `false` | The [CellBridge](https://github.com/PatrickMatthiesen/cellbridge) beta6 source demo lane. Adds PostgreSQL, schema setup, a seeded `integration-writer` account and `CellBridge.WebDemo` at `https://localhost:7292/library`. WebDemo hosts both the library and protocol endpoints in one process. Requires `IncludeCellBridgeDemo=true` at build time; see below. |
 | `AppHost:CellBridgeTestPassword` | `WopiHost-CellBridge-Demo-2026!` | Password of the seeded `integration-writer` account in the cellbridge lane (12+ chars with upper, lower, digit and symbol). |
+
+## CellBridge source demo
+
+The demo requires the CellBridge beta6 source checkout, which contains
+`src/CellBridge.WebDemo`, `tools/CellBridge.Storage.Setup` and `tools/CellBridge.Admin`.
+`CellBridgeRepoRoot` defaults to a sibling `../cellbridge` checkout.
+`IncludeCellBridgeDemo` is auto-enabled when that checkout contains `CellBridge.slnx`;
+it can also be set explicitly. Keep the checkout outside this repository so it uses its
+own package configuration. For a checkout in another location:
+
+```bash
+# Build the optional source lane, then enable it at runtime.
+dotnet build infra/WopiHost.AppHost -p:IncludeCellBridgeDemo=true -p:CellBridgeRepoRoot=/path/to/cellbridge
+```
+
+Start the AppHost with `AppHost:UseCellBridge=true` using the same build properties.
+Setting `IncludeCellBridgeDemo=false` compiles the AppHost without the lane, even when
+`AppHost:UseCellBridge=true` is configured.
+
+Open `https://localhost:7292/library` and sign in as `integration-writer` with
+`AppHost:CellBridgeTestPassword`. The PostgreSQL volume `wopihost-cellbridge-storage`
+preserves the database across runs. The seed command rejects an existing test account
+whose password or permissions differ, so changing the configured password does not
+reset an existing account. Authentication uses CellBridge's local key-protection
+certificate under the current user's local application-data directory.
+
+This is CellBridge's standalone demo, separate from the WopiHost CellBridge adapter.
+Desktop Office needs a reachable, trusted HTTPS origin. Building or starting this lane
+does not verify desktop editing or Office Online interoperability. Consult the beta6
+checkout's `docs/demo-library.md` and `docs/interoperability.md` for its client coverage.
 
 ## End-to-end tests
 

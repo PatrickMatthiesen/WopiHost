@@ -12,10 +12,7 @@ using WopiHost.Abstractions;
 namespace WopiHost.CellBridge;
 
 /// <summary>Opt-in adapter using shared protocol authority and conditional external publishing.</summary>
-public sealed class CoordinatedCellBridgeProcessor : ICobaltProcessor, IWopiEditingCoordinator
-#if CELLBRIDGE_WHOLE_FILE_SAVES
-    , IWopiCoordinatedFileMutations
-#endif
+public sealed class CoordinatedCellBridgeProcessor : ICobaltProcessor, IWopiEditingCoordinator, IWopiCoordinatedFileMutations
 {
     private readonly CellBridgeDocumentService _documents;
     private readonly CellBridgeRequestProcessor _requests;
@@ -86,7 +83,7 @@ public sealed class CoordinatedCellBridgeProcessor : ICobaltProcessor, IWopiEdit
             if (execution.LockError == "FileUnauthorizedAccess")
                 throw new UnauthorizedAccessException();
             if (execution.LockError is not null)
-                throw new WopiResourceLockedException(file.Identifier, execution.State.Coordination.HostLock?.Token ?? string.Empty);
+                throw new WopiResourceLockedException(file.Identifier, (await ReadLockAsync(id, actor, cancellationToken).ConfigureAwait(false)).CurrentLock ?? string.Empty);
             response = execution.Response.ToByteArray(_options.SerializationProfile);
         }
         // A pending delivery is durable work, not a request-completion callback. The packaged
@@ -96,7 +93,6 @@ public sealed class CoordinatedCellBridgeProcessor : ICobaltProcessor, IWopiEdit
         return response;
     }
 
-#if CELLBRIDGE_WHOLE_FILE_SAVES
     private static readonly string[] s_wholeFileExtensions = ["docx", "xlsx", "pptx"];
 
     public bool SupportsPutFile(IWopiFile file) =>
@@ -169,28 +165,29 @@ public sealed class CoordinatedCellBridgeProcessor : ICobaltProcessor, IWopiEdit
         {
             for (var attempt = 0; attempt < 16; attempt++)
             {
-                var current = await _documents.Provider.State.FindByResourceIdAsync(baseline.ResourceId, timeout.Token).ConfigureAwait(false);
+                var current = await _documents.Provider.Documents.FindAsync(new DocumentIdentity.Resource(baseline.ResourceId), timeout.Token).ConfigureAwait(false);
                 if (current is null || current.IsDeleted || current.LifecycleGeneration != accepted.Revision.LifecycleGeneration ||
-                    current.Publication is not { } publication || publication.BindingId != baseline.Publication!.BindingId)
+                    current.Delivery is not { } publication || publication.BindingId != baseline.Delivery!.BindingId)
                     return new(WopiCoordinatedPutFileStatus.Conflict, IsReplay: accepted.IsReplay);
-                if (!publication.Pending.Any(r => r.ContentVersion <= accepted.Revision.ContentVersion))
+                // Repositories do not return blocked deliveries as runnable work.
+                if (publication.BlockedReason is not null)
+                    return new(WopiCoordinatedPutFileStatus.Conflict, IsReplay: accepted.IsReplay);
+                var pending = await _documents.Provider.Documents.ReadNextDeliveryAsync(baseline.ResourceId, timeout.Token).ConfigureAwait(false);
+                if (pending is not null && (pending.Current.LifecycleGeneration != current.LifecycleGeneration ||
+                    pending.Binding != publication)) continue;
+                if (pending is null || pending.Revision.ContentVersion > accepted.Revision.ContentVersion)
                 {
-                    var verified = await VerifyAcknowledgedDestinationAsync(current, publication, timeout.Token).ConfigureAwait(false);
-                    if (!verified)
-                    {
-                        // A concurrent publisher can advance the next head while the snapshot
-                        // is being read. Retry that newer baseline before declaring a conflict.
-                        var latest = await _documents.Provider.State.FindByResourceIdAsync(baseline.ResourceId, timeout.Token).ConfigureAwait(false);
-                        if (latest is { IsDeleted: false } && latest.LifecycleGeneration == current.LifecycleGeneration &&
-                            latest.Publication is { } advanced && advanced.BindingId == publication.BindingId &&
-                            (advanced.ExpectedRevision != publication.ExpectedRevision || !advanced.Pending.SequenceEqual(publication.Pending)))
-                            continue;
-                    }
+                    var verified = await VerifyAcknowledgedDestinationAsync(current, publication, pending, timeout.Token).ConfigureAwait(false);
+                    // Destination verification can wait while another publisher or lifecycle
+                    // operation advances the document. Revalidate that exact binding before success.
+                    var latest = await _documents.Provider.Documents.FindAsync(new DocumentIdentity.Resource(baseline.ResourceId), timeout.Token).ConfigureAwait(false);
+                    if (latest is null || latest.IsDeleted || latest.LifecycleGeneration != current.LifecycleGeneration ||
+                        latest.Delivery is not { } advanced || advanced.BindingId != publication.BindingId)
+                        return new(WopiCoordinatedPutFileStatus.Conflict, IsReplay: accepted.IsReplay);
+                    if (advanced != publication || latest.StateVersion != current.StateVersion) continue;
                     return new(verified ? WopiCoordinatedPutFileStatus.Applied : WopiCoordinatedPutFileStatus.Conflict,
                         verified ? publication.ExpectedRevision : null, accepted.IsReplay);
                 }
-                if (publication.BlockedReason is not null)
-                    return new(WopiCoordinatedPutFileStatus.Conflict, IsReplay: accepted.IsReplay);
                 var delivered = await _publisher.PublishNextAsync(baseline.ResourceId, timeout.Token).ConfigureAwait(false);
                 if (delivered == PublicationAttempt.TransientFailure)
                     return new(WopiCoordinatedPutFileStatus.Pending, IsReplay: accepted.IsReplay);
@@ -208,12 +205,13 @@ public sealed class CoordinatedCellBridgeProcessor : ICobaltProcessor, IWopiEdit
         return new(WopiCoordinatedPutFileStatus.Pending, IsReplay: accepted.IsReplay);
     }
 
-    private async Task<bool> VerifyAcknowledgedDestinationAsync(DocumentState current, ExternalPublicationState publication, CancellationToken ct)
+    private async Task<bool> VerifyAcknowledgedDestinationAsync(DocumentHead current, DocumentDeliveryBinding publication, DeliveryRead? pending, CancellationToken ct)
     {
         // A content no-op creates no delivery entry. Verify the existing baseline as well so
         // an unrelated remote edit cannot turn an empty queue into a false success.
-        var acknowledged = publication.Pending.IsEmpty ? current.Content : current.Revisions
-            .LastOrDefault(r => r.ContentVersion < publication.Pending[0].ContentVersion)?.Content;
+        var acknowledged = pending is null ? current.Package :
+            (await _documents.Provider.Documents.ReadRevisionsAsync(current.ResourceId, 0, 1,
+                pending.Revision.Package.RevisionNumber, ct).ConfigureAwait(false))?.Revisions.SingleOrDefault()?.Package;
         if (acknowledged is null) return false;
         var baseline = await _destination.ReadAsync(publication.Destination, ct).ConfigureAwait(false);
         await using var source = baseline.Content.ConfigureAwait(false);
@@ -233,8 +231,6 @@ public sealed class CoordinatedCellBridgeProcessor : ICobaltProcessor, IWopiEdit
         return length == baseline.Length && Convert.ToHexStringLower(hash.GetHashAndReset()) == baseline.Sha256;
     }
 
-#endif
-
     public async Task<WopiEditingLockResult> ProcessLockAsync(IWopiFile file, ClaimsPrincipal principal,
         WopiEditingLockOperation operation, string? token, string? replacementToken = null,
         CancellationToken cancellationToken = default)
@@ -245,9 +241,9 @@ public sealed class CoordinatedCellBridgeProcessor : ICobaltProcessor, IWopiEdit
         {
             // Observing a conflict must not import or bind a missing protocol resource.
             var id = ResourceId(file.Identifier);
-            var current = await _documents.Provider.State.FindByResourceIdAsync(id, cancellationToken).ConfigureAwait(false);
+            var current = await _documents.Provider.Documents.FindAsync(new DocumentIdentity.Resource(id), cancellationToken).ConfigureAwait(false);
             if (current is null) return new(true, null);
-            if (current.Publication is { } bound && bound.Destination != file.Identifier)
+            if (current.Delivery is { } bound && bound.Destination != file.Identifier)
                 throw new InvalidOperationException("Destination binding mismatch.");
             try
             {
@@ -277,16 +273,11 @@ public sealed class CoordinatedCellBridgeProcessor : ICobaltProcessor, IWopiEdit
         return new(false, observed.CurrentLock);
     }
 
-    private ValueTask<WopiEditingLockResult> ReadLockAsync(Guid id, CellBridgeActor actor, CancellationToken ct) =>
-        _documents.Provider.State.TransitionAsync(id, (state, now) =>
-        {
-            if (!_documents.Access(actor, state).HasFlag(DocumentAccess.Write)) throw new UnauthorizedAccessException();
-            var coordination = state.Coordination;
-            var foreign = coordination.Exclusive is { } exclusive && exclusive.ExpiresUtc > now ||
-                coordination.SchemaOwners.Any(l => l.ExpiresUtc > now);
-            var active = coordination.HostLock is { } host && host.ExpiresUtc > now ? host.Token : null;
-            return new StateTransition<WopiEditingLockResult>(null, new(!foreign, active));
-        }, ct);
+    private async ValueTask<WopiEditingLockResult> ReadLockAsync(Guid id, CellBridgeActor actor, CancellationToken ct)
+    {
+        var snapshot = await new SharedDocumentLocks(_documents).ReadAsync(id, actor, ct).ConfigureAwait(false);
+        return new(!snapshot.OfficeLockActive, snapshot.HostLockToken);
+    }
 
     private async Task<CellBridgeActor> ActorAsync(IWopiFile file, ClaimsPrincipal principal, CancellationToken ct)
     {
@@ -302,12 +293,12 @@ public sealed class CoordinatedCellBridgeProcessor : ICobaltProcessor, IWopiEdit
         return new(new(subject, name, name)) { AccessLimit = new(ResourceId(file.Identifier), access) };
     }
 
-    private async Task<DocumentState> ImportAsync(IWopiFile file, CellBridgeActor actor, CancellationToken ct)
+    private async Task<DocumentHead> ImportAsync(IWopiFile file, CellBridgeActor actor, CancellationToken ct)
     {
         var id = ResourceId(file.Identifier);
         var provider = _documents.Provider;
-        var current = await provider.State.FindByResourceIdAsync(id, ct).ConfigureAwait(false);
-        if (current?.Publication is { } bound)
+        var current = await provider.Documents.FindAsync(new DocumentIdentity.Resource(id), ct).ConfigureAwait(false);
+        if (current?.Delivery is { } bound)
         {
             if (bound.Destination != file.Identifier) throw new InvalidOperationException("Destination binding mismatch.");
             if (!_documents.Access(actor, current).HasFlag(DocumentAccess.Read)) throw new UnauthorizedAccessException();
@@ -332,17 +323,17 @@ public sealed class CoordinatedCellBridgeProcessor : ICobaltProcessor, IWopiEdit
             throw new InvalidDataException("Destination baseline verification failed.");
         var importer = new CellBridgeActor(new("wopi:host", "wopi-host", "WOPI host"), CanCreate: true);
         current ??= await _documents.ImportAsync(id, DocumentPath(file), bytes, actor.Identity, importer, ct).ConfigureAwait(false);
-        current ??= await provider.State.FindByResourceIdAsync(id, ct).ConfigureAwait(false)
+        current ??= await provider.Documents.FindAsync(new DocumentIdentity.Resource(id), ct).ConfigureAwait(false)
             ?? throw new InvalidOperationException("Document import did not create the selected resource.");
         // Another importer may have won. Bind only an exact verified byte baseline.
-        if (current.Content.Length != baseline.Length || current.Content.Sha256 != baseline.Sha256)
+        if (current.Package.Length != baseline.Length || current.Package.Sha256 != baseline.Sha256)
             throw new InvalidDataException("The imported revision differs from the destination baseline.");
-        if (current.Publication is null)
+        if (current.Delivery is null)
             await _publisher.BindAsync(id, current.LifecycleGeneration, current.StateVersion, Guid.NewGuid(),
                 file.Identifier, baseline.Revision, ct).ConfigureAwait(false);
-        current = await provider.State.FindByResourceIdAsync(id, ct).ConfigureAwait(false)
+        current = await provider.Documents.FindAsync(new DocumentIdentity.Resource(id), ct).ConfigureAwait(false)
             ?? throw new InvalidOperationException("Document disappeared during binding.");
-        if (current.Publication is null || current.Publication.Destination != file.Identifier)
+        if (current.Delivery is null || current.Delivery.Destination != file.Identifier)
             throw new InvalidOperationException("The destination could not be bound atomically.");
         if (!_documents.Access(actor, current).HasFlag(DocumentAccess.Read)) throw new UnauthorizedAccessException();
         return current;
