@@ -1,23 +1,42 @@
-name: Coordinated CellBridge PutFile
+name: CellBridge host CI
 
 on:
+  push:
+    branches: [implement/cellbridge-host-wrapper]
   pull_request:
     paths:
       - 'src/WopiHost.Abstractions/**'
       - 'src/WopiHost.Core/**'
       - 'src/WopiHost.CellBridge/**'
+      - 'sample/**'
+      - 'infra/**'
+      - 'test/WopiHost.Core.Tests/**'
+      - 'test/WopiHost.CellBridge.Tests/**'
       - 'test/WopiHost.IntegrationTests/**'
-      - 'Directory.Packages.props'
+      - 'test/WopiHost.Abstractions.Testing/**'
+      - '**/*.props'
+      - '**/*.targets'
+      - 'global.json'
+      - 'nuget.config'
       - '.github/workflows/cellbridge-coordinated-putfile.yml'
   workflow_dispatch:
 
 permissions:
   contents: read
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+env:
+  # Keep aligned with the CellBridge packages in Directory.Packages.props.
+  CELLBRIDGE_PINNED_REF: 03b2ee92d28b6dffa283405681323b54c594bd5d
+
 jobs:
   http:
+    name: Core, adapter and PostgreSQL HTTP (${{ matrix.dependency }})
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 30
     services:
       postgres:
         image: postgres:17-alpine
@@ -32,6 +51,7 @@ jobs:
           --health-timeout 5s
           --health-retries 10
     strategy:
+      fail-fast: false
       matrix:
         dependency: [packages, source]
     env:
@@ -41,30 +61,69 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           path: wopihost
+          persist-credentials: false
       # Pin the matching release source outside WopiHost so its central package
       # management cannot apply to CellBridge. Test packages and source separately.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           repository: PatrickMatthiesen/cellbridge
-          ref: 03b2ee92d28b6dffa283405681323b54c594bd5d
+          ref: ${{ env.CELLBRIDGE_PINNED_REF }}
           path: cellbridge
+          persist-credentials: false
       - uses: actions/setup-dotnet@a98b56852c35b8e3190ac28c8c2271da59106c68 # v6.0.0
         with:
           global-json-file: wopihost/global.json
       # Both checkouts name nuget.org differently in their source mappings.
       # Use one configuration for the complete restore graph so NuGet cannot
       # discard a source alias while retaining the other checkout's mapping.
-      - name: Restore HTTP tests
+      - name: Restore and build core, adapter and HTTP tests
         working-directory: wopihost
-        run: dotnet restore test/WopiHost.IntegrationTests/WopiHost.IntegrationTests.csproj --configfile nuget.config -p:CellBridgeSourceRoot="$CELLBRIDGE_SOURCE_ROOT" -p:IncludeCellBridgeDemo=false -p:IncludeCobalt=false
-      - name: Build HTTP tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          properties=(-p:CellBridgeSourceRoot="$CELLBRIDGE_SOURCE_ROOT" -p:IncludeCellBridgeDemo=false -p:IncludeCobalt=false -p:ContinuousIntegrationBuild=true)
+          for project in WopiHost.Core.Tests WopiHost.CellBridge.Tests WopiHost.IntegrationTests; do
+            dotnet restore "test/$project/$project.csproj" --configfile nuget.config "${properties[@]}"
+            dotnet build "test/$project/$project.csproj" --no-restore "${properties[@]}" -m:1
+          done
+      - name: Test core
         working-directory: wopihost
-        run: dotnet build test/WopiHost.IntegrationTests/WopiHost.IntegrationTests.csproj --no-restore -p:CellBridgeSourceRoot="$CELLBRIDGE_SOURCE_ROOT" -p:IncludeCellBridgeDemo=false -p:IncludeCobalt=false -m:1
-      - name: Test routed PutFile with PostgreSQL and transactional destination storage
+        run: dotnet artifacts/bin/WopiHost.Core.Tests/debug/WopiHost.Core.Tests.dll -noLogo -noColor -result-trx "$RUNNER_TEMP/core.trx"
+      - name: Test CellBridge adapter
         working-directory: wopihost
-        run: dotnet artifacts/bin/WopiHost.IntegrationTests/debug/WopiHost.IntegrationTests.dll -class '*CoordinatedPutFileHttpTests' -noLogo -noColor -result-trx "$RUNNER_TEMP/coordinated-putfile.trx"
+        run: dotnet artifacts/bin/WopiHost.CellBridge.Tests/debug/WopiHost.CellBridge.Tests.dll -noLogo -noColor -result-trx "$RUNNER_TEMP/adapter.trx"
+      - name: Test coordinated and legacy writes with PostgreSQL
+        working-directory: wopihost
+        run: dotnet artifacts/bin/WopiHost.IntegrationTests/debug/WopiHost.IntegrationTests.dll -class '*CoordinatedPutFileHttpTests' -class '*CoordinatedEditingEndpointTests' -class '*FileMutatingEndpointTests' -noLogo -noColor -result-trx "$RUNNER_TEMP/coordinated-putfile.trx"
+      - name: Verify tests executed
+        shell: python
+        run: |
+          import os
+          from pathlib import Path
+          import xml.etree.ElementTree as ET
+
+          for suite in ("core", "adapter", "coordinated-putfile"):
+              report = Path(os.environ["RUNNER_TEMP"]) / f"{suite}.trx"
+              counters = ET.parse(report).find(".//{*}Counters")
+              if counters is None or int(counters.get("executed", "0")) == 0:
+                  raise SystemExit(f"{suite}: no executed tests in {report}")
+              if suite == "coordinated-putfile" and counters.get("total") != counters.get("executed"):
+                  raise SystemExit("The coordinated HTTP suite must run without skipped tests")
+              print(f"{suite}: {counters.attrib}")
+      - name: Build AppHost with the pinned CellBridge demo
+        if: matrix.dependency == 'source'
+        working-directory: wopihost
+        shell: bash
+        run: |
+          set -euo pipefail
+          properties=(-p:CellBridgeSourceRoot="$CELLBRIDGE_SOURCE_ROOT" -p:CellBridgeRepoRoot="$CELLBRIDGE_SOURCE_ROOT" -p:IncludeCellBridgeDemo=true -p:IncludeCobalt=false -p:ContinuousIntegrationBuild=true)
+          dotnet restore infra/WopiHost.AppHost/WopiHost.AppHost.csproj --configfile nuget.config "${properties[@]}"
+          dotnet build infra/WopiHost.AppHost/WopiHost.AppHost.csproj --no-restore "${properties[@]}" -m:1
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         if: always()
         with:
-          name: coordinated-putfile-results-${{ matrix.dependency }}
-          path: ${{ runner.temp }}/coordinated-putfile.trx
+          name: cellbridge-host-results-${{ matrix.dependency }}
+          path: |
+            ${{ runner.temp }}/core.trx
+            ${{ runner.temp }}/adapter.trx
+            ${{ runner.temp }}/coordinated-putfile.trx
