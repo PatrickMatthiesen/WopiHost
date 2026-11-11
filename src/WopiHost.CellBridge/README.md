@@ -37,6 +37,12 @@ In the sample host, select CellBridge in configuration instead:
 }
 ```
 
+The processor publishes accepted saves to the WOPI file under a per-resource write gate. A delayed older completion cannot overwrite a newer successful publication, and a replay retries a failed file write. The processor marks a version as written only after the target stream commits. This coordination applies within one processor instance. Other file writers and multiple host processes require the coordinated setup's conditional publication.
+
+SOAP supports `EditorsTable`, `GetDocMetaInfo` and `GetVersions` alongside Cell and editing-lock operations. `GetVersions` reports the current file at the client's URL with versioning disabled and an empty settings URL. Its catalog ID identifies the processor's in-memory imports for that process lifetime. The adapter does not expose CellBridge history download or settings routes. Rename and version restoration remain unsupported in this setup.
+
+Set `WebOrigin` to the public HTTP(S) origin for SOAP requests, or leave it empty to use the current request's scheme and host through the automatically registered `IHttpContextAccessor`. SOAP file URLs are echoed in responses, and every operation targets the file selected by the WOPI route.
+
 Register only one editing backend. For persistent editing state and shared WOPI and CellBridge locks, use the coordinated setup below.
 
 ## Coordinated setup

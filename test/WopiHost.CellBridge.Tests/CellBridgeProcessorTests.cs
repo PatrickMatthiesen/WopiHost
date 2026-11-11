@@ -1,9 +1,15 @@
+using System.Collections.Immutable;
 using System.Globalization;
 using System.IO.Compression;
+using System.Reflection;
 using System.Security.Claims;
 using System.Text;
 using System.Xml.Linq;
+using CellBridge.AspNetCore;
 using CellBridge.FssHttpB;
+using CellBridge.Storage;
+using CellBridge.Storage.Abstractions;
+using Microsoft.AspNetCore.Http;
 using FakeItEasy;
 using Microsoft.Extensions.Logging.Abstractions;
 using Microsoft.Extensions.Options;
@@ -24,7 +30,7 @@ public class CellBridgeProcessorTests
 
     private static CellBridgeProcessor CreateProcessor() =>
         new(NullLogger<CellBridgeProcessor>.Instance,
-            Options.Create(new CellBridgeProcessorOptions { SerializationProfile = FsshttpbSerializationProfile.Current }));
+            Options.Create(new CellBridgeProcessorOptions { SerializationProfile = FsshttpbSerializationProfile.Current, WebOrigin = "https://wopi.example.test" }));
 
     private static IWopiWritableFile CreateFile(string identifier = "file-1", byte[]? content = null, string extension = "txt")
     {
@@ -187,8 +193,13 @@ public class CellBridgeProcessorTests
         Assert.Contains("UserName=\"Ada Lovelace\"", response, StringComparison.Ordinal);
         Assert.Contains("UserLogin=\"Ada Lovelace\"", response, StringComparison.Ordinal);
         Assert.Contains("ServerTime=\"", response, StringComparison.Ordinal);
-        // cellbridge keeps GetVersions inside its own HTTP endpoint; the adapter must say so rather than fake a success.
-        Assert.Contains("SubRequestToken=\"3\" ErrorCode=\"NotSupported\"", response, StringComparison.Ordinal);
+        Assert.Equal("Success", (string?)SubResponse(responseBytes, 3).Attribute("ErrorCode"));
+        var versions = SubResponse(responseBytes, 3);
+        Assert.Equal("0", (string?)versions.Descendants().Single(e => e.Name.LocalName == "versioning").Attribute("enabled"));
+        Assert.Equal("", (string?)versions.Descendants().Single(e => e.Name.LocalName == "settings").Attribute("url"));
+        var current = Assert.Single(versions.Descendants(), e => e.Name.LocalName == "result");
+        Assert.Equal("https://wopi.example.test/wopi/file-1.txt", (string?)current.Attribute("url"));
+        Assert.Equal(s_content.Length.ToString(CultureInfo.InvariantCulture), (string?)current.Attribute("size"));
     }
 
     [Fact]
@@ -274,7 +285,10 @@ public class CellBridgeProcessorTests
         var sub = SubResponse(responseBytes, 1);
         Assert.Equal("Success", (string?)sub.Attribute("ErrorCode"));
         var payload = Convert.FromBase64String(SubResponseData(sub).Value);
-        var inner = Assert.Single(FsshttpbResponse.Deserialize(new BinaryReaderEx(payload)).SubResponses);
+        var decoded = FsshttpbResponse.Deserialize(new BinaryReaderEx(payload));
+        Assert.Equal(FsshttpbCellRequest.CurrentProtocolVersion, decoded.ProtocolVersion);
+        Assert.Equal(FsshttpbCellRequest.MinimumProtocolVersion, decoded.MinimumVersion);
+        var inner = Assert.Single(decoded.SubResponses);
         Assert.Equal(5UL, inner.RequestId);
         Assert.IsType<QueryAccessSubResponseData>(inner.Data);
     }
@@ -315,13 +329,13 @@ public class CellBridgeProcessorTests
     {
         using var processor = CreateProcessor();
         var body = SoapEnvelope("""
-            <SubRequest Type="GetVersions" SubRequestToken="1" />
+            <SubRequest Type="Cell" SubRequestToken="1"><SubRequestData BinaryDataSize="4">not base64</SubRequestData></SubRequest>
             <SubRequest Type="WhoAmI" SubRequestToken="2" DependsOn="1" DependencyType="OnSuccess" />
             """);
 
         var responseBytes = await processor.ProcessCobalt(CreateFile(), CreatePrincipal(), body, CancellationToken.None);
 
-        Assert.Equal("NotSupported", (string?)SubResponse(responseBytes, 1).Attribute("ErrorCode"));
+        Assert.Equal("InvalidArgument", (string?)SubResponse(responseBytes, 1).Attribute("ErrorCode"));
         var dependent = SubResponse(responseBytes, 2);
         Assert.Equal("DependentOnlyOnSuccessRequestFailed", (string?)dependent.Attribute("ErrorCode"));
         Assert.Null(SubResponseData(dependent).Attribute("UserName"));
@@ -424,6 +438,198 @@ public class CellBridgeProcessorTests
 
         Assert.Equal("True", (string?)SubResponseData(SubResponse(alone, 1)).Attribute("AmIAlone"));
     }
+
+    [Theory]
+    [InlineData(FsshttpbSerializationProfile.Current)]
+    [InlineData(FsshttpbSerializationProfile.SharePoint13_11)]
+    public async Task ProcessCobalt_SoapCell_PreservesTheConfiguredSerializationProfile(FsshttpbSerializationProfile profile)
+    {
+        using var processor = new CellBridgeProcessor(NullLogger<CellBridgeProcessor>.Instance,
+            Options.Create(new CellBridgeProcessorOptions { SerializationProfile = profile, WebOrigin = "https://wopi.example.test" }));
+        var cell = CellRequest(new FsshttpbCellSubRequest(RequestTypes.QueryAccess) { RequestId = 1, Data = new QueryAccessSubRequestData() });
+        var response = await processor.ProcessCobalt(CreateFile(), CreatePrincipal(), SoapEnvelope($"""
+            <SubRequest Type="Cell" SubRequestToken="1"><SubRequestData BinaryDataSize="{cell.Length}">{Convert.ToBase64String(cell)}</SubRequestData></SubRequest>
+            """));
+        var binary = Convert.FromBase64String(SubResponseData(SubResponse(response, 1)).Value);
+        Assert.Equal(new FsshttpbResponse().ToByteArray(profile)[..4], binary[..4]);
+    }
+
+    [Fact]
+    public async Task ProcessCobalt_ConcurrentFirstRequests_ShareTheSameImport()
+    {
+        using var processor = CreateProcessor();
+        var file = CreateFile();
+        var import = new TaskCompletionSource<Stream>(TaskCreationOptions.RunContinuationsAsynchronously);
+        A.CallTo(() => file.OpenReadAsync(A<CancellationToken>._)).Returns(import.Task);
+        var first = QueryAsync(processor, file);
+        var second = QueryAsync(processor, file);
+        A.CallTo(() => file.OpenReadAsync(A<CancellationToken>._)).MustHaveHappenedOnceExactly();
+        import.SetResult(OpenRead(s_content));
+        var responses = await Task.WhenAll(first, second);
+        Assert.All(responses, response => Assert.False(Assert.Single(response.SubResponses).Status));
+        A.CallTo(() => file.OpenReadAsync(A<CancellationToken>._)).MustHaveHappenedOnceExactly();
+    }
+
+    [Fact]
+    public async Task ProcessCobalt_SoapMetadataAndVersions_ReturnCurrentFileDataAndPermitDependencies()
+    {
+        using var processor = CreateProcessor();
+        var response = await processor.ProcessCobalt(CreateFile(), CreatePrincipal(), SoapEnvelope("""
+            <SubRequest Type="GetDocMetaInfo" SubRequestToken="1" />
+            <SubRequest Type="GetVersions" SubRequestToken="2" DependsOn="1" DependencyType="OnSuccess" />
+            <SubRequest Type="WhoAmI" SubRequestToken="3" DependsOn="2" DependencyType="OnSuccess" />
+            <SubRequest Type="FileOperation" SubRequestToken="4"><SubRequestData FileOperation="Rename" NewFileName="renamed.txt" /></SubRequest>
+            <SubRequest Type="Versioning" SubRequestToken="5"><SubRequestData VersioningRequestType="RestoreVersion" Version="1.0" /></SubRequest>
+            """));
+        Assert.Equal("Success", (string?)SubResponse(response, 1).Attribute("ErrorCode"));
+        var properties = SubResponse(response, 1).Descendants().Where(e => e.Name.LocalName == "Property")
+            .ToDictionary(e => (string)e.Attribute("Key")!, e => (string)e.Attribute("Value")!);
+        Assert.Equal(s_content.Length.ToString(CultureInfo.InvariantCulture), properties["vti_filesize"]);
+        Assert.Equal("wopi-host", properties["vti_author"]);
+        Assert.Equal("Success", (string?)SubResponse(response, 2).Attribute("ErrorCode"));
+        Assert.Equal("Ada Lovelace", (string?)SubResponseData(SubResponse(response, 3)).Attribute("UserName"));
+        Assert.Equal("NotSupported", (string?)SubResponse(response, 4).Attribute("ErrorCode"));
+        Assert.Equal("NotSupported", (string?)SubResponse(response, 5).Attribute("ErrorCode"));
+    }
+
+    [Fact]
+    public async Task ProcessCobalt_SoapEditorsTable_UpdatesTheBinaryEditorsPartition()
+    {
+        using var processor = CreateProcessor();
+        var file = CreateFile();
+        var clientId = Guid.NewGuid();
+        var joined = await processor.ProcessCobalt(file, CreatePrincipal(), SoapEnvelope($"""
+            <SubRequest Type="EditorsTable" SubRequestToken="1">
+              <SubRequestData EditorsTableRequestType="JoinEditingSession" ClientID="{clientId:D}" Timeout="3600" AsEditor="true" />
+            </SubRequest>
+            """));
+        Assert.Equal("Success", (string?)SubResponse(joined, 1).Attribute("ErrorCode"));
+        var response = FsshttpbResponse.Deserialize(new BinaryReaderEx(await processor.ProcessCobalt(file, CreatePrincipal(),
+            CellRequest(new FsshttpbCellSubRequest(RequestTypes.QueryChanges)
+            {
+                RequestId = 1, TargetPartitionId = StoredDocument.EditorsTablePartitionId,
+                Data = new QueryChangesSubRequestData { IncludeStorageManifest = true, IncludeCellChanges = true },
+            }))));
+        var query = Assert.IsType<QueryChangesSubResponseData>(Assert.Single(response.SubResponses).Data);
+        var bytes = PartitionGraphSnapshot.Create(response.DataElementPackage!.DataElements, query.StorageIndexExtendedGuid).Materialize();
+        var headerLength = EditorsTablePartitionBuilder.ZipStreamHeader.Length;
+        using var compressed = new MemoryStream(bytes, headerLength, bytes.Length - headerLength, writable: false);
+        using var inflater = new DeflateStream(compressed, CompressionMode.Decompress);
+        var editor = Assert.Single(XDocument.Load(inflater).Root!.Elements("Editor"));
+        Assert.Equal(clientId.ToString("B"), (string?)editor.Element("CacheID"));
+    }
+
+    [Fact]
+    public async Task ProcessCobalt_SoapOrigin_UsesTheHttpRequestAndEchoesTheClientUrl()
+    {
+        var context = new DefaultHttpContext();
+        context.Request.Scheme = "https";
+        context.Request.Host = new HostString("actual.example.test", 8443);
+        using var processor = new CellBridgeProcessor(NullLogger<CellBridgeProcessor>.Instance,
+            Options.Create(new CellBridgeProcessorOptions()), new HttpContextAccessor { HttpContext = context });
+        var response = XDocument.Parse(Encoding.UTF8.GetString(await processor.ProcessCobalt(CreateFile(), CreatePrincipal(),
+            SoapEnvelope("<SubRequest Type=\"WhoAmI\" SubRequestToken=\"1\" />"))));
+        Assert.Equal("https://actual.example.test:8443", (string?)response.Descendants().Single(e => e.Name.LocalName == "ResponseCollection").Attribute("WebUrl"));
+        Assert.Equal("https://wopi.example.test/wopi/file-1.txt", (string?)response.Descendants().Single(e => e.Name.LocalName == "Response").Attribute("Url"));
+    }
+
+    [Fact]
+    public async Task ProcessCobalt_SoapSuppliedResourceId_CannotTargetAnotherImportedFile()
+    {
+        using var processor = CreateProcessor();
+        var second = CreateFile("other", Encoding.UTF8.GetBytes("another file"));
+        await QueryAsync(processor, second);
+        var otherId = (await HeadAsync(processor, second)).ResourceId;
+        var body = Encoding.UTF8.GetString(SoapEnvelope("<SubRequest Type=\"GetDocMetaInfo\" SubRequestToken=\"1\" />"))
+            .Replace("RequestToken=\"1\">", $"RequestToken=\"1\" UseResourceID=\"true\" ResourceID=\"{otherId:D}\">", StringComparison.Ordinal);
+        var response = await processor.ProcessCobalt(CreateFile(), CreatePrincipal(), Encoding.UTF8.GetBytes(body));
+        var size = SubResponse(response, 1).Descendants().Single(e => (string?)e.Attribute("Key") == "vti_filesize");
+        Assert.Equal(s_content.Length.ToString(CultureInfo.InvariantCulture), (string?)size.Attribute("Value"));
+    }
+
+    [Fact]
+    public async Task ProcessCobalt_FailedWriteCommit_ReplayedSaveRetriesUntilCommitted()
+    {
+        using var processor = CreateProcessor();
+        var file = CreateFile(content: MinimalDocx("before"), extension: "docx");
+        var query = await QueryAsync(processor, file);
+        var content = MinimalDocx("after");
+        var save = PutChanges(query, 2, content);
+        using var failed = new FailingCommitStream();
+        using var committed = new MemoryStream();
+        A.CallTo(() => file.OpenWriteAsync(A<CancellationToken>._)).Returns(Task.FromResult<Stream>(failed)).Once()
+            .Then.Returns(Task.FromResult<Stream>(committed));
+        await Assert.ThrowsAsync<IOException>(() => processor.ProcessCobalt(file, CreatePrincipal(), save));
+        var response = await processor.ProcessCobalt(file, CreatePrincipal(), save);
+        Assert.False(Assert.Single(FsshttpbResponse.Deserialize(new BinaryReaderEx(response)).SubResponses).Status);
+        Assert.Equal(content, committed.ToArray());
+        await processor.ProcessCobalt(file, CreatePrincipal(), save);
+        A.CallTo(() => file.OpenWriteAsync(A<CancellationToken>._)).MustHaveHappenedTwiceExactly();
+    }
+
+    [Fact]
+    public async Task ProcessCobalt_SoapLaterSubrequestFails_StillWritesTheAcceptedSave()
+    {
+        using var processor = CreateProcessor();
+        var file = CreateFile(content: MinimalDocx("before"), extension: "docx");
+        var query = await QueryAsync(processor, file);
+        var content = MinimalDocx("after");
+        var save = PutChanges(query, 2, content);
+        using var written = new MemoryStream();
+        A.CallTo(() => file.OpenWriteAsync(A<CancellationToken>._)).Returns(Task.FromResult<Stream>(written));
+        var response = await processor.ProcessCobalt(file, CreatePrincipal(), SoapEnvelope($"""
+            <SubRequest Type="Cell" SubRequestToken="1"><SubRequestData BinaryDataSize="{save.Length}">{Convert.ToBase64String(save)}</SubRequestData></SubRequest>
+            <SubRequest Type="Cell" SubRequestToken="2"><SubRequestData BinaryDataSize="4">invalid base64</SubRequestData></SubRequest>
+            """));
+        Assert.Equal("Success", (string?)SubResponse(response, 1).Attribute("ErrorCode"));
+        Assert.Equal("InvalidArgument", (string?)SubResponse(response, 2).Attribute("ErrorCode"));
+        Assert.Equal(content, written.ToArray());
+        A.CallTo(() => file.OpenWriteAsync(A<CancellationToken>._)).MustHaveHappenedOnceExactly();
+    }
+
+    [Fact]
+    public async Task MirrorContent_DelayedOlderAcceptedReceipt_DoesNotRewriteTheNewerFile()
+    {
+        using var processor = CreateProcessor();
+        var file = CreateFile(content: MinimalDocx("initial"), extension: "docx");
+        var query = await QueryAsync(processor, file);
+        var service = Field<CellBridgeDocumentService>(processor, "_documents");
+        var head = await HeadAsync(processor, file);
+        var actor = new CellBridgeActor(new SubjectIdentity("wopi:user-42", "Ada Lovelace", "Ada Lovelace"));
+        // Delay this real accepted receipt at the publication boundary. A newer request
+        // completes its WOPI write first, then the older receipt resumes.
+        var oldExecution = await service.ExecuteAsync(head.ResourceId, DocumentPartitionKind.FileContents,
+            FsshttpbCellRequest.Deserialize(new BinaryReaderEx(PutChanges(query, 2, MinimalDocx("older")))),
+            new Dictionary<string, string>(), actor);
+        var oldReceipt = Assert.Single(oldExecution.AcceptedSaves);
+        var newerContent = MinimalDocx("newer");
+        using var written = new MemoryStream();
+        A.CallTo(() => file.OpenWriteAsync(A<CancellationToken>._)).Returns(Task.FromResult<Stream>(written));
+        await processor.ProcessCobalt(file, CreatePrincipal(), PutChanges(await QueryAsync(processor, file), 3, newerContent));
+        var mirror = typeof(CellBridgeProcessor).GetMethod("MirrorContentAsync", BindingFlags.Instance | BindingFlags.NonPublic)!;
+        await (Task)mirror.Invoke(processor, [file, head.ResourceId, ImmutableArray.Create(oldReceipt), CancellationToken.None])!;
+        Assert.Equal(newerContent, written.ToArray());
+        A.CallTo(() => file.OpenWriteAsync(A<CancellationToken>._)).MustHaveHappenedOnceExactly();
+    }
+
+    private sealed class FailingCommitStream : MemoryStream
+    {
+        public override ValueTask DisposeAsync() => ValueTask.FromException(new IOException("commit failed"));
+    }
+
+    private static T Field<T>(CellBridgeProcessor processor, string name) =>
+        (T)typeof(CellBridgeProcessor).GetField(name, BindingFlags.Instance | BindingFlags.NonPublic)!.GetValue(processor)!;
+
+    private static async Task<DocumentHead> HeadAsync(CellBridgeProcessor processor, IWopiWritableFile file) =>
+        (await Field<StorageProvider>(processor, "_storage").Documents.FindAsync(
+            new DocumentIdentity.Path(StorageIds.PathKey("/wopi/" + Uri.EscapeDataString(file.Identifier) + "." + file.Extension))))!;
+
+    private static async Task<FsshttpbResponse> QueryAsync(CellBridgeProcessor processor, IWopiWritableFile file) =>
+        FsshttpbResponse.Deserialize(new BinaryReaderEx(await processor.ProcessCobalt(file, CreatePrincipal(),
+            CellRequest(new FsshttpbCellSubRequest(RequestTypes.QueryChanges)
+            {
+                RequestId = 1, Data = new QueryChangesSubRequestData { IncludeStorageManifest = true, IncludeCellChanges = true },
+            }))));
 
     // Mirrors what a client does with a QueryChanges response: reuse the server's cell identity and
     // current storage index, and propose a new storage index over a freshly built content graph.
