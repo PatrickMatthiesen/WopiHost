@@ -531,16 +531,25 @@ internal static class FileMutatingEndpoints
     private static async Task<Results<NotFound, FileContentHttpResult>> ProcessCobalt(
         [AsParameters] ProcessCobaltRequest req)
     {
-        ArgumentNullException.ThrowIfNull(req.WritableStorage);
-        // Resolve the file before checking the Cobalt processor so a missing file surfaces as
-        // 404 (per spec) regardless of whether the host has Cobalt wired up. Missing processor
-        // is a host-config issue and falls through to ArgumentNullException → 500 below.
-        var file = await req.WritableStorage.GetWritableFile(req.Id, req.CancellationToken).ConfigureAwait(false);
-        if (file is null) return TypedResults.NotFound();
-        ArgumentNullException.ThrowIfNull(req.CobaltProcessor);
-
-        var bytes = await req.Http.Request.Body.ReadBytesAsync(req.CancellationToken).ConfigureAwait(false);
-        var responseBytes = await req.CobaltProcessor.ProcessCobalt(file, req.Http.User, bytes, req.CancellationToken).ConfigureAwait(false);
+        byte[] responseBytes;
+        if (req.Http.RequestServices.GetService<IWopiEditingCoordinator>() is not null &&
+            req.Http.RequestServices.GetService<IWopiCoordinatedCobaltProcessor>() is { } coordinated)
+        {
+            var file = await req.Storage.GetWopiFile(req.Id, req.CancellationToken).ConfigureAwait(false);
+            if (file is null || !file.Exists) return TypedResults.NotFound();
+            var bytes = await req.Http.Request.Body.ReadBytesAsync(req.CancellationToken).ConfigureAwait(false);
+            responseBytes = await coordinated.ProcessCobalt(file, req.Http.User, bytes, req.CancellationToken).ConfigureAwait(false);
+        }
+        else
+        {
+            ArgumentNullException.ThrowIfNull(req.WritableStorage);
+            // Resolve the file before the processor so missing resources return 404.
+            var file = await req.WritableStorage.GetWritableFile(req.Id, req.CancellationToken).ConfigureAwait(false);
+            if (file is null || !file.Exists) return TypedResults.NotFound();
+            ArgumentNullException.ThrowIfNull(req.CobaltProcessor);
+            var bytes = await req.Http.Request.Body.ReadBytesAsync(req.CancellationToken).ConfigureAwait(false);
+            responseBytes = await req.CobaltProcessor.ProcessCobalt(file, req.Http.User, bytes, req.CancellationToken).ConfigureAwait(false);
+        }
         if (!string.IsNullOrEmpty(req.CorrelationId))
         {
             req.Http.Response.Headers.Append(WopiHeaders.CorrelationId, req.CorrelationId);
@@ -553,7 +562,7 @@ internal static class FileMutatingEndpoints
         [AsParameters] ProcessLockRequest req)
     {
         var file = await req.Storage.GetWopiFile(req.Id, req.CancellationToken).ConfigureAwait(false);
-        if (file is null) return TypedResults.NotFound();
+        if (file is null || !file.Exists) return TypedResults.NotFound();
         req.Http.Response.Headers[WopiHeaders.ItemVersion] = file.Version;
         if (req.Http.RequestServices.GetService<IWopiEditingCoordinator>() is { } coordinator)
         {
@@ -877,6 +886,7 @@ internal readonly record struct DeleteFileRequest(
 internal readonly record struct ProcessCobaltRequest(
     [FromRoute] string Id,
     HttpContext Http,
+    IWopiStorageProvider Storage,
     [FromServices] IWopiWritableStorageProvider? WritableStorage,
     [FromServices] ICobaltProcessor? CobaltProcessor,
     [FromHeader(Name = WopiHeaders.CorrelationId)] string? CorrelationId,

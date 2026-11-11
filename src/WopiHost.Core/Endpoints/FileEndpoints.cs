@@ -68,21 +68,16 @@ internal static class FileEndpoints
 
         _ = req.MemoryCache.TryGetValue($"{UserInfoCacheKeyPrefix}{req.Http.User.GetUserId()}", out string? userInfo);
 
-        // Capabilities must mirror what's actually wired up — advertising features the host
-        // can't deliver would lie to the WOPI client. Cobalt provides the multi-user editing
-        // surface, so SupportsCoauth tracks its registration alongside SupportsCobalt.
-        // SupportsUpdate / SupportsRename / SupportsDeleteFile must reflect writable-storage
-        // presence; without it PutFile / RenameFile / DeleteFile all 501 via
-        // RequiresWritableStorageEndpointFilter, and DefaultCheckFileInfoBuilder cascades
-        // SupportsUpdate=false into UserCanNotWriteRelative=true per
-        // https://learn.microsoft.com/microsoft-365/cloud-storage-partner-program/rest/files/putrelativefile.
         var coordinated = req.Http.RequestServices.GetService<IWopiEditingCoordinator>() is not null;
+        var supportsCobalt = coordinated
+            ? req.Http.RequestServices.GetService<IWopiCoordinatedCobaltProcessor>() is not null
+            : req.CobaltProcessor is not null && req.WritableStorage is not null;
         var capabilities = new WopiHostCapabilities
         {
-            SupportsCobalt = req.CobaltProcessor is not null,
+            SupportsCobalt = supportsCobalt,
             SupportsGetLock = coordinated || req.LockProvider is not null,
             SupportsLocks = coordinated || req.LockProvider is not null,
-            SupportsCoauth = req.CobaltProcessor is not null,
+            SupportsCoauth = supportsCobalt,
             SupportsUpdate = coordinated
                 ? req.Http.RequestServices.GetService<IWopiCoordinatedFileMutations>()?.SupportsPutFile(file) == true
                 : req.WritableStorage is not null,

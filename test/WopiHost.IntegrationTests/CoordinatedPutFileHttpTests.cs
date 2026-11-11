@@ -4,6 +4,7 @@ using System.Net;
 using System.Text;
 using System.Text.Json;
 using CellBridge.AspNetCore;
+using CellBridge.FssHttpB;
 using CellBridge.Storage.Abstractions;
 using CellBridge.Storage.InMemory;
 using CellBridge.Storage.PostgreSql;
@@ -18,6 +19,212 @@ namespace WopiHost.IntegrationTests;
 
 public sealed class CoordinatedPutFileHttpTests
 {
+    [Fact]
+    public async Task CobaltBinaryRequestUsesReadOnlyStorageAndHostPermissionCeiling()
+    {
+        using var host = await Host.Create();
+        Assert.Null(host.Factory.Services.GetService<IWopiWritableStorageProvider>());
+        Assert.False(await host.Destination.GetWopiFile(SqliteRevisionStore.FileId) is IWopiWritableFile);
+        var body = new FsshttpbCellRequest();
+        body.SubRequests.Add(new(RequestTypes.QueryAccess) { RequestId = 1, Data = new QueryAccessSubRequestData() });
+        using (var response = await host.Cobalt(body.ToByteArray()))
+        {
+            Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+            var result = FsshttpbResponse.Deserialize(new BinaryReaderEx(await response.Content.ReadAsByteArrayAsync()));
+            var access = Assert.IsType<QueryAccessSubResponseData>(Assert.Single(result.SubResponses).Data);
+            Assert.Null(access.ReadAccessError);
+            Assert.Null(access.WriteAccessError);
+        }
+        host.PermissionAllowsWrite = false;
+        using (var response = await host.Cobalt(body.ToByteArray()))
+        {
+            Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+            var result = FsshttpbResponse.Deserialize(new BinaryReaderEx(await response.Content.ReadAsByteArrayAsync()));
+            var access = Assert.IsType<QueryAccessSubResponseData>(Assert.Single(result.SubResponses).Data);
+            Assert.Null(access.ReadAccessError);
+            Assert.NotNull(access.WriteAccessError);
+        }
+        Assert.Single(await host.Storage.Documents.ListAsync(0, 100));
+        Assert.Equal(0, host.Destination.DirectWrites);
+        Assert.Equal(0, host.Destination.ReceiptCount());
+        using var info = await host.Client.GetAsync(host.Url());
+        info.EnsureSuccessStatusCode();
+        using var json = JsonDocument.Parse(await info.Content.ReadAsStringAsync());
+        Assert.True(json.RootElement.GetProperty("SupportsCobalt").GetBoolean());
+        Assert.True(host.PutFileCallbacks.CheckFileInfo!.SupportsCoauth);
+    }
+
+    [Fact]
+    public async Task CobaltPutChangesPublishesConditionallyAndHonorsTheSharedHostLock()
+    {
+        using var host = await Host.Create();
+        var queryRequest = new FsshttpbCellRequest();
+        queryRequest.SubRequests.Add(new(RequestTypes.QueryChanges) { RequestId = 1,
+            Data = new QueryChangesSubRequestData { IncludeStorageManifest = true, IncludeCellChanges = true } });
+        using var queried = await host.Cobalt(queryRequest.ToByteArray());
+        Assert.Equal(HttpStatusCode.OK, queried.StatusCode);
+        var query = FsshttpbResponse.Deserialize(new BinaryReaderEx(await queried.Content.ReadAsByteArrayAsync()));
+        var data = Assert.IsType<QueryChangesSubResponseData>(Assert.Single(query.SubResponses).Data);
+        var control = (await host.Storage.Documents.ReadControlAsync((await host.Head()).ResourceId))!;
+        var partition = control.Partitions.Single(value => value.Kind == 0);
+        var cell = new CellId(new ExGuid(partition.Identity.CellLong.Value, partition.Identity.CellLong.Guid),
+            new ExGuid(partition.Identity.CellShort.Value, partition.Identity.CellShort.Guid));
+        static ExGuid Fresh() => new(1, Guid.NewGuid());
+        var identity = new StorageManifestBuilder.StableIdentity(Fresh(), Fresh(), Fresh(), Fresh(), Fresh(), Fresh(), Fresh(), cell, Guid.NewGuid());
+        var graph = FileContentPartitionBuilder.BuildQueryChangesResponse(1, Package("saved"), identity, data.CellKnowledgeTo + 1);
+        graph.DataElementPackage!.DataElements.Add(query.DataElementPackage!.DataElements.Single(element =>
+            element.DataElementExtendedGuid.Equals(data.StorageIndexExtendedGuid)));
+        var save = new FsshttpbCellRequest { DataElementPackage = graph.DataElementPackage };
+        save.SubRequests.Add(new(RequestTypes.PutChanges) { RequestId = 2, Data = new PutChangesSubRequestData
+        { StorageIndex = ((QueryChangesSubResponseData)graph.SubResponses.Single().Data!).StorageIndexExtendedGuid,
+            ExpectedStorageIndex = data.StorageIndexExtendedGuid } });
+        var body = save.ToByteArray();
+        await host.Lock("held");
+        using (var refused = await host.Cobalt(body))
+        {
+            Assert.Equal(HttpStatusCode.Conflict, refused.StatusCode);
+            Assert.Equal("held", Assert.Single(refused.Headers.GetValues("X-WOPI-Lock")));
+            Assert.Equal(0, host.Destination.ReceiptCount());
+        }
+        using (var unlocked = await host.Request("UNLOCK", "held")) Assert.Equal(HttpStatusCode.OK, unlocked.StatusCode);
+        using var accepted = await host.Cobalt(body);
+        Assert.Equal(HttpStatusCode.OK, accepted.StatusCode);
+        var result = FsshttpbResponse.Deserialize(new BinaryReaderEx(await accepted.Content.ReadAsByteArrayAsync()));
+        Assert.False(Assert.Single(result.SubResponses).Status);
+        Assert.Equal(1, host.Destination.ReceiptCount());
+        Assert.Equal(0, host.Destination.DirectWrites);
+        Assert.Equal(2, (await host.Revisions()).Length);
+        using var package = new ZipArchive(new MemoryStream(await host.Read()));
+        using var reader = new StreamReader(package.GetEntry("word/document.xml")!.Open());
+        Assert.Contains("saved", await reader.ReadToEndAsync());
+    }
+
+    [Fact]
+    public async Task CobaltSoapUsesAuthenticatedIdentityAndSharesLocksWithoutWritableStorage()
+    {
+        using var host = await Host.Create();
+        using (var identity = await host.Cobalt(Soap("<SubRequest Type=\"WhoAmI\" SubRequestToken=\"1\" />")))
+        {
+            Assert.Equal(HttpStatusCode.OK, identity.StatusCode);
+            var result = await identity.Content.ReadAsStringAsync();
+            Assert.Contains("ErrorCode=\"Success\"", result);
+            Assert.Contains($"UserName=\"{Host.User.DisplayName}\"", result);
+            Assert.Contains($"UserLogin=\"{Host.User.DisplayName}\"", result);
+        }
+        var lease = Guid.NewGuid();
+        using (var acquired = await host.Cobalt(Soap($"<SubRequest Type=\"ExclusiveLock\" SubRequestToken=\"1\"><SubRequestData ExclusiveLockRequestType=\"GetLock\" ExclusiveLockID=\"{lease:D}\" ClientID=\"{Guid.NewGuid():D}\" Timeout=\"3600\"/></SubRequest>")))
+        {
+            Assert.Equal(HttpStatusCode.OK, acquired.StatusCode);
+            Assert.Contains("ErrorCode=\"Success\"", await acquired.Content.ReadAsStringAsync());
+        }
+        using var refused = await host.Request("LOCK", "wopi");
+        Assert.Equal(HttpStatusCode.Conflict, refused.StatusCode);
+        Assert.Equal(string.Empty, Assert.Single(refused.Headers.GetValues("X-WOPI-Lock")));
+        Assert.DoesNotContain(lease.ToString(), string.Join("", refused.Headers.SelectMany(header => header.Value)));
+        Assert.Equal(0, host.Destination.DirectWrites);
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task StaleCobaltLookupDoesNotImportOrReadDestination(bool legacy)
+    {
+        var processor = new RecordingCobaltProcessor();
+        using var host = await Host.Create(writableStorage: legacy, configure: services =>
+        {
+            if (!legacy) return;
+            services.RemoveAll<IWopiEditingCoordinator>();
+            services.RemoveAll<IWopiCoordinatedCobaltProcessor>();
+            services.RemoveAll<ICobaltProcessor>();
+            services.AddSingleton<ICobaltProcessor>(processor);
+        });
+        host.Destination.FileExists = false;
+        var reads = host.Destination.ReadCalls;
+        using var response = await host.Cobalt(Soap("<SubRequest Type=\"WhoAmI\" SubRequestToken=\"1\" />"));
+        Assert.Equal(HttpStatusCode.NotFound, response.StatusCode);
+        Assert.Equal(reads, host.Destination.ReadCalls);
+        Assert.Empty(await host.Storage.Documents.ListAsync(0, 100));
+        Assert.Equal(0, processor.Calls);
+        Assert.Equal(0, host.Destination.DirectWrites);
+    }
+
+    [Fact]
+    public async Task StaleCobaltLookupDoesNotChangeAnImportedDocument()
+    {
+        using var host = await Host.Create();
+        await host.Lock("held");
+        var before = (await host.Storage.Documents.ReadControlAsync((await host.Head()).ResourceId))!;
+        host.Destination.FileExists = false;
+        var reads = host.Destination.ReadCalls;
+        using var response = await host.Cobalt(Soap("<SubRequest Type=\"WhoAmI\" SubRequestToken=\"1\" />"));
+        Assert.Equal(HttpStatusCode.NotFound, response.StatusCode);
+        Assert.Equal(reads, host.Destination.ReadCalls);
+        var after = (await host.Storage.Documents.ReadControlAsync(before.Head.ResourceId))!;
+        Assert.Equal(before.Head.StateVersion, after.Head.StateVersion);
+        Assert.Equal(before.Coordination, after.Coordination);
+        Assert.Equal(0, host.Destination.ReceiptCount());
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task StaleLockLookupDoesNotImportOrChangeExistingCoordination(bool imported)
+    {
+        using var host = await Host.Create();
+        if (imported) await host.Lock("held");
+        var before = imported ? await host.Storage.Documents.ReadControlAsync((await host.Head()).ResourceId) : null;
+        host.Destination.FileExists = false;
+        var reads = host.Destination.ReadCalls;
+        using var response = await host.Request("LOCK", "replacement", imported ? "held" : null);
+        Assert.Equal(HttpStatusCode.NotFound, response.StatusCode);
+        Assert.Equal(reads, host.Destination.ReadCalls);
+        if (before is null) Assert.Empty(await host.Storage.Documents.ListAsync(0, 100));
+        else
+        {
+            var after = await host.Storage.Documents.ReadControlAsync(before.Head.ResourceId);
+            Assert.Equal(before.Coordination, after!.Coordination);
+            Assert.Equal(before.Head.StateVersion, after.Head.StateVersion);
+        }
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task CobaltWithoutRequiredStorageOrCoordinatedCapabilityReturns501(bool coordinator)
+    {
+        var processor = new RecordingCobaltProcessor();
+        using var host = await Host.Create(configure: services =>
+        {
+            services.RemoveAll<IWopiCoordinatedCobaltProcessor>();
+            services.RemoveAll<ICobaltProcessor>();
+            services.AddSingleton<ICobaltProcessor>(processor);
+            if (!coordinator) services.RemoveAll<IWopiEditingCoordinator>();
+        });
+        using var response = await host.Cobalt(Soap("<SubRequest Type=\"WhoAmI\" SubRequestToken=\"1\" />"));
+        Assert.Equal(HttpStatusCode.NotImplemented, response.StatusCode);
+        Assert.Equal(0, processor.Calls);
+        using var info = await host.Client.GetAsync(host.Url());
+        info.EnsureSuccessStatusCode();
+        using var json = JsonDocument.Parse(await info.Content.ReadAsStringAsync());
+        Assert.False(json.RootElement.GetProperty("SupportsCobalt").GetBoolean());
+        Assert.False(host.PutFileCallbacks.CheckFileInfo!.SupportsCoauth);
+    }
+
+    private static byte[] Soap(string subRequest) => Encoding.UTF8.GetBytes($"""
+        <soap:Envelope xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/"><soap:Body><ExecuteCellStorageRequest xmlns="http://schemas.microsoft.com/sharepoint/soap/"><RequestVersion Version="2" MinorVersion="2"/><RequestCollection CorrelationId="{Guid.NewGuid():D}"><Request Url="https://wopi.example.test/wopi/files/{SqliteRevisionStore.FileId}" RequestToken="1">{subRequest}</Request></RequestCollection></ExecuteCellStorageRequest></soap:Body></soap:Envelope>
+        """);
+
+    private sealed class RecordingCobaltProcessor : ICobaltProcessor
+    {
+        public int Calls { get; private set; }
+        public Task<byte[]> ProcessCobalt(IWopiWritableFile file, System.Security.Claims.ClaimsPrincipal principal,
+            byte[] newContent, CancellationToken cancellationToken = default)
+        {
+            Calls++;
+            throw new InvalidOperationException("The legacy processor must not run.");
+        }
+    }
+
     [Fact]
     public async Task GetLockBeforeEditingDoesNotImportTheDocument()
     {
@@ -479,7 +686,8 @@ public sealed class CoordinatedPutFileHttpTests
         public WopiBackendFactory Factory { get; private set; } = null!;
         public HttpClient Client { get; private set; } = null!;
         public string Token { get; private set; } = "";
-        public static async Task<Host> Create(long? maxFileSize = null, string extension = "docx")
+        public static async Task<Host> Create(long? maxFileSize = null, string extension = "docx",
+            bool writableStorage = false, Action<IServiceCollection>? configure = null)
         {
             var host = new Host(); Directory.CreateDirectory(host._root);
             host.Destination = new(host.DatabasePath, extension); host.Destination.Initialize(Package("initial"));
@@ -507,7 +715,8 @@ public sealed class CoordinatedPutFileHttpTests
             {
                 if (maxFileSize is not null) services.Configure<WopiHostOptions>(options => options.MaxFileSize = maxFileSize);
                 services.RemoveAll<IWopiStorageProvider>(); services.RemoveAll<IWopiWritableStorageProvider>(); services.RemoveAll<ICobaltProcessor>(); services.RemoveAll<IWopiEditingCoordinator>();
-                services.AddSingleton<IWopiStorageProvider>(host.Destination); services.AddSingleton<IWopiWritableStorageProvider>(host.Destination);
+                services.AddSingleton<IWopiStorageProvider>(host.Destination);
+                if (writableStorage) services.AddSingleton<IWopiWritableStorageProvider>(host.Destination);
                 services.AddSingleton(host.Destination); services.AddSingleton(host.Policy);
                 services.RemoveAll<IWopiHostExtensions>();
                 services.AddSingleton<IWopiHostExtensions>(host.PutFileCallbacks);
@@ -524,6 +733,7 @@ public sealed class CoordinatedPutFileHttpTests
                 }).Build());
                 // Keep immediate publication, but make retry/recovery scheduling deterministic.
                 services.Remove(services.Last(descriptor => descriptor.ServiceType == typeof(Microsoft.Extensions.Hosting.IHostedService)));
+                configure?.Invoke(services);
             });
             host.Client = host.Factory.CreateClient(); host.Token = await host.TokenWith(WopiFilePermissions.UserCanWrite | WopiFilePermissions.UserCanRename);
             return host;
@@ -546,6 +756,13 @@ public sealed class CoordinatedPutFileHttpTests
             request.Headers.Add("X-WopiHost-OperationId", (operation ?? Guid.NewGuid()).ToString("D"));
             if (editors is not null) request.Headers.Add("X-WOPI-Editors", editors);
             return await Client.SendAsync(request, cancellationToken);
+        }
+        public async Task<HttpResponseMessage> Cobalt(byte[] body)
+        {
+            using var request = new HttpRequestMessage(HttpMethod.Post, Url());
+            request.Headers.Add("X-WOPI-Override", "COBALT");
+            request.Content = new ByteArrayContent(body);
+            return await Client.SendAsync(request);
         }
         public Task<byte[]> Read() => Client.GetByteArrayAsync(Url("/contents"));
         public async Task<DocumentHead> Head() => Assert.Single(await Storage.Documents.ListAsync(0, 100));
@@ -598,6 +815,14 @@ public sealed class CoordinatedPutFileHttpTests
         {
             get => Volatile.Read(ref _failNext) != 0;
             set => Volatile.Write(ref _failNext, value ? 1 : 0);
+        }
+
+        public WopiCheckFileInfo? CheckFileInfo { get; private set; }
+
+        public override Task<WopiCheckFileInfo> OnCheckFileInfoAsync(WopiCheckFileInfoContext context, CancellationToken cancellationToken = default)
+        {
+            CheckFileInfo = context.CheckFileInfo;
+            return Task.FromResult(context.CheckFileInfo);
         }
 
         public override async Task OnPutFileAsync(WopiPutFileContext context, CancellationToken cancellationToken = default)

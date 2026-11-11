@@ -22,7 +22,7 @@ public static class ServiceCollectionExtensions
     {
         ArgumentNullException.ThrowIfNull(services);
         ArgumentNullException.ThrowIfNull(configuration);
-        if (services.Any(d => d.ServiceType == typeof(ICobaltProcessor) || d.ServiceType == typeof(IWopiEditingCoordinator)))
+        if (services.Any(d => d.ServiceType == typeof(ICobaltProcessor) || d.ServiceType == typeof(IWopiCoordinatedCobaltProcessor) || d.ServiceType == typeof(IWopiEditingCoordinator)))
             throw new InvalidOperationException("Configure exactly one editing backend and shared authority.");
         if (services.Any(d => d.ServiceType == typeof(TRevisionStore) && d.Lifetime != ServiceLifetime.Singleton))
             throw new InvalidOperationException("The conditional destination must be a singleton.");
@@ -35,6 +35,7 @@ public static class ServiceCollectionExtensions
         services.AddCellBridgeExternalPublishing<WopiRevisionDestination>();
         services.AddSingleton<CoordinatedCellBridgeProcessor>();
         services.AddSingleton<ICobaltProcessor>(sp => sp.GetRequiredService<CoordinatedCellBridgeProcessor>());
+        services.AddSingleton<IWopiCoordinatedCobaltProcessor>(sp => sp.GetRequiredService<CoordinatedCellBridgeProcessor>());
         services.AddSingleton<IWopiEditingCoordinator>(sp => sp.GetRequiredService<CoordinatedCellBridgeProcessor>());
         services.AddSingleton<IWopiCoordinatedFileMutations>(sp => sp.GetRequiredService<CoordinatedCellBridgeProcessor>());
         return services;

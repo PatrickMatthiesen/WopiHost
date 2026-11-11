@@ -12,7 +12,7 @@ using WopiHost.Abstractions;
 namespace WopiHost.CellBridge;
 
 /// <summary>Opt-in adapter using shared protocol authority and conditional external publishing.</summary>
-public sealed class CoordinatedCellBridgeProcessor : ICobaltProcessor, IWopiEditingCoordinator, IWopiCoordinatedFileMutations
+public sealed class CoordinatedCellBridgeProcessor : ICobaltProcessor, IWopiCoordinatedCobaltProcessor, IWopiEditingCoordinator, IWopiCoordinatedFileMutations
 {
     private readonly CellBridgeDocumentService _documents;
     private readonly CellBridgeRequestProcessor _requests;
@@ -41,7 +41,11 @@ public sealed class CoordinatedCellBridgeProcessor : ICobaltProcessor, IWopiEdit
         _permissions = permissions;
     }
 
-    public async Task<byte[]> ProcessCobalt(IWopiWritableFile file, ClaimsPrincipal principal, byte[] newContent,
+    public Task<byte[]> ProcessCobalt(IWopiWritableFile file, ClaimsPrincipal principal, byte[] newContent,
+        CancellationToken cancellationToken = default) =>
+        ProcessCobalt((IWopiFile)file, principal, newContent, cancellationToken);
+
+    public async Task<byte[]> ProcessCobalt(IWopiFile file, ClaimsPrincipal principal, byte[] newContent,
         CancellationToken cancellationToken = default)
     {
         ArgumentNullException.ThrowIfNull(file);

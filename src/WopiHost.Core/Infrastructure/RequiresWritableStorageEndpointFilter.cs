@@ -22,6 +22,8 @@ internal sealed class RequiresWritableStorageEndpointFilter : IEndpointFilter
             var operations = endpoint?.Metadata.GetMetadata<WopiOverrideMetadata>()?.Values;
             if ((endpoint?.Metadata.GetMetadata<WopiPutFileMetadata>() is not null &&
                 http.RequestServices.GetService<IWopiCoordinatedFileMutations>() is not null) ||
+                (operations is not null && operations.All(op => op == WopiFileOperations.Cobalt) &&
+                    http.RequestServices.GetService<IWopiCoordinatedCobaltProcessor>() is not null) ||
                 operations is not null && operations.All(op => op is WopiFileOperations.Lock or
                     WopiFileOperations.Put or WopiFileOperations.Unlock or WopiFileOperations.RefreshLock or WopiFileOperations.GetLock))
                 return next(context);

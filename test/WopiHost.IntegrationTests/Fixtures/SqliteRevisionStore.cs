@@ -19,6 +19,8 @@ internal sealed class SqliteRevisionStore(string databasePath, string extension 
     public bool BlockNextReadUntilCancelled { get; set; }
     public TaskCompletionSource ReadStarted { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
     public TaskCompletionSource ReadCancelled { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
+    public bool FileExists { get; set; } = true;
+    public int ReadCalls { get; private set; }
     public int DirectWrites { get; private set; }
     public IWopiContainer RootContainer { get; } = new Root();
     public int FileNameMaxLength => 250;
@@ -39,6 +41,7 @@ internal sealed class SqliteRevisionStore(string databasePath, string extension 
     }
     public async Task<WopiRevisionRead> ReadAsync(string fileId, CancellationToken cancellationToken = default)
     {
+        ReadCalls++;
         if (FailNextRead) { FailNextRead = false; throw new IOException("Destination temporarily unavailable."); }
         if (MissingNextRead) { MissingNextRead = false; throw new FileNotFoundException("Destination disappeared after lookup."); }
         if (BlockNextReadUntilCancelled)
@@ -105,7 +108,7 @@ internal sealed class SqliteRevisionStore(string databasePath, string extension 
         command.Parameters.AddWithValue("$bytes", bytes); command.Parameters.AddWithValue("$id", FileId); command.ExecuteNonQuery();
     }
     public Task<IWopiFile?> GetWopiFile(string identifier, CancellationToken cancellationToken = default) => Task.FromResult<IWopiFile?>(identifier == FileId ? new File(this) : null);
-    public Task<IWopiWritableFile?> GetWritableFile(string identifier, CancellationToken cancellationToken = default) => Task.FromResult<IWopiWritableFile?>(identifier == FileId ? new File(this) : null);
+    public Task<IWopiWritableFile?> GetWritableFile(string identifier, CancellationToken cancellationToken = default) => Task.FromResult<IWopiWritableFile?>(identifier == FileId ? new WritableFile(this) : null);
     public Task<IWopiContainer?> GetWopiContainer(string identifier, CancellationToken cancellationToken = default) => Task.FromResult<IWopiContainer?>(identifier == "root" ? RootContainer : null);
     public async IAsyncEnumerable<IWopiFile> GetWopiFiles(string identifier, IReadOnlyCollection<string>? fileExtensions = null, [EnumeratorCancellation] CancellationToken cancellationToken = default) { await Task.CompletedTask; if (identifier == "root") yield return new File(this); }
     public async IAsyncEnumerable<IWopiContainer> GetWopiContainers(string identifier, [EnumeratorCancellation] CancellationToken cancellationToken = default) { await Task.CompletedTask; yield break; }
@@ -124,14 +127,19 @@ internal sealed class SqliteRevisionStore(string databasePath, string extension 
     public Task<string> GetSuggestedFileName(string containerId, string name, CancellationToken cancellationToken = default) => Task.FromResult(name);
     public Task<string> GetSuggestedContainerName(string containerId, string name, CancellationToken cancellationToken = default) => Task.FromResult(name);
     private sealed class Root : IWopiContainer { public string Identifier => "root"; public string Name => "root"; public long Size => 0; public int ChildCount => 1; }
-    private sealed class File(SqliteRevisionStore store) : IWopiWritableFile
+    private class File(SqliteRevisionStore store) : IWopiFile
     {
-        public string Identifier => FileId; public string Name => "test." + store.Extension; public string Owner => "coordinated"; public bool Exists => true; public string Extension => store.Extension;
+        public string Identifier => FileId; public string Name => "test." + store.Extension; public string Owner => "coordinated"; public bool Exists => store.FileExists; public string Extension => store.Extension;
         public DateTime LastWriteTimeUtc => DateTime.UnixEpoch;
         public long Length { get { var value = store.ReadAsync(FileId).GetAwaiter().GetResult(); value.Content.Dispose(); return value.Length; } }
         public string? Version { get { var value = store.ReadAsync(FileId).GetAwaiter().GetResult(); value.Content.Dispose(); return value.Revision; } }
         public ReadOnlyMemory<byte>? Checksum => null;
         public async Task<Stream> OpenReadAsync(CancellationToken cancellationToken = default) => (await store.ReadAsync(FileId, cancellationToken)).Content;
-        public Task<Stream> OpenWriteAsync(CancellationToken cancellationToken = default) { store.DirectWrites++; throw new InvalidOperationException("Direct stream writes bypass coordination."); }
+    }
+    private sealed class WritableFile : File, IWopiWritableFile
+    {
+        private readonly SqliteRevisionStore _store;
+        public WritableFile(SqliteRevisionStore store) : base(store) => _store = store;
+        public Task<Stream> OpenWriteAsync(CancellationToken cancellationToken = default) { _store.DirectWrites++; throw new InvalidOperationException("Direct stream writes bypass coordination."); }
     }
 }

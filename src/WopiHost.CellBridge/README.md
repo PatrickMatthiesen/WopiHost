@@ -56,6 +56,8 @@ builder.Services.AddCoordinatedCellBridgeProcessor<MyFileStore>(
 
 `MyFileStore` implements `IWopiRevisionStore`. Its saves must update the file bytes, version and a record of the completed save in a single transaction. That record lets a retry return the original result without writing the file again. Other applications writing to the same file store must also update its version. WopiHost's download provider must read these same bytes and versions.
 
+Coordinated COBALT resolves files through `IWopiStorageProvider` and uses the optional `IWopiCoordinatedCobaltProcessor` capability together with `IWopiEditingCoordinator`. It does not require `IWopiWritableStorageProvider`. The legacy `ICobaltProcessor` contract still requires writable storage.
+
 You must supply this file-store implementation. The bundled FileSystem and Azure providers do not implement `IWopiRevisionStore`.
 
 Configure a stable resource namespace and your public server address:

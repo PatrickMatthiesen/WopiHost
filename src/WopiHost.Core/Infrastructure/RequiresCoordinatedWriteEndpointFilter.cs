@@ -18,11 +18,15 @@ internal sealed class RequiresCoordinatedWriteEndpointFilter : IEndpointFilter
             return InvokeCoordinatedAsync(context, next);
         var operations = endpoint?.Metadata.GetMetadata<WopiOverrideMetadata>()?.Values;
         // Use selected endpoint metadata, not a spoofable header on a PutFile route.
-        if (operations is not null && operations.All(op => op is WopiFileOperations.Cobalt or
+        if (operations is not null && operations.All(op => op == WopiFileOperations.Cobalt) &&
+            http.RequestServices.GetService<IWopiCoordinatedCobaltProcessor>() is not null)
+            return InvokeCoordinatedAsync(context, next);
+        if (operations is not null && operations.All(op => op is
             WopiFileOperations.Lock or WopiFileOperations.Put or WopiFileOperations.Unlock or
             WopiFileOperations.RefreshLock or WopiFileOperations.GetLock)) return InvokeCoordinatedAsync(context, next);
         http.Response.Headers[WopiHeaders.MutationFailureReason] = operations?.FirstOrDefault() switch
         {
+            WopiFileOperations.Cobalt => "Coordinated COBALT processing is unavailable.",
             WopiFileOperations.PutRelativeFile => "Coordinated relative file creation and overwrite are unavailable.",
             WopiFileOperations.RenameFile => "Coordinated file rename requires atomic catalog and protocol path updates.",
             WopiFileOperations.DeleteFile => "Coordinated file deletion requires tombstone and publication retirement.",

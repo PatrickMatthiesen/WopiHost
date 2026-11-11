@@ -78,7 +78,13 @@ public static class ServiceCollectionExtensions
         // Suggested-target / relative-target name-negotiation for PutRelativeFile and
         // CreateChildFile — the spec defines the protocol identically for both, so it lives
         // in one place.
-        services.TryAddScoped<IWopiNewChildFileNegotiator, DefaultWopiNewChildFileNegotiator>();
+        services.TryAddScoped<IWopiNewChildFileNegotiator>(provider =>
+            provider.GetService<IWopiWritableStorageProvider>() is { } writable
+                ? new DefaultWopiNewChildFileNegotiator(
+                    provider.GetRequiredService<IWopiStorageProvider>(), writable,
+                    provider.GetRequiredService<IWopiPermissionProvider>(),
+                    provider.GetService<IWopiLockProvider>())
+                : new UnavailableNewChildFileNegotiator());
 
         services.AddOptions<WopiHostOptions>()
             .Configure(o =>
