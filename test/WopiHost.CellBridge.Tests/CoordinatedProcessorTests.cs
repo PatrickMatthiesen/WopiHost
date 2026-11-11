@@ -1,10 +1,15 @@
 using System.Security.Claims;
+using System.Reflection;
+using System.Threading.Channels;
+using System.Text.Json;
 using System.IO.Compression;
 using System.Security.Cryptography;
 using System.Text;
 using System.Xml.Linq;
 using CellBridge.AspNetCore;
+using CellBridge.FssHttp;
 using CellBridge.FssHttpB;
+using CellBridge.Storage;
 using CellBridge.Storage.Abstractions;
 using CellBridge.Storage.InMemory;
 using FakeItEasy;
@@ -26,6 +31,164 @@ public sealed class CoordinatedProcessorTests
         Assert.Equal(0, host.Destination.Writes);
         A.CallTo(() => host.File.OpenWriteAsync(A<CancellationToken>._)).MustNotHaveHappened();
     }
+
+    [Theory]
+    [InlineData(0u, "http://schemas.xmlsoap.org/soap/envelope/")]
+    [InlineData(1u, "http://www.w3.org/2003/05/soap-envelope")]
+    [InlineData(3u, "http://schemas.xmlsoap.org/soap/envelope/")]
+    [InlineData(65535u, "http://www.w3.org/2003/05/soap-envelope")]
+    public async Task UnsupportedSoapVersionDoesNotReadImportBindOrPublish(uint version, string soapNamespace)
+    {
+        using var host = new Host();
+        var body = Soap("<SubRequest Type=\"WhoAmI\" SubRequestToken=\"1\" />", version: version, soapNamespace: soapNamespace);
+        var response = await host.Processor.ProcessCobalt(host.File, Principal(), body);
+        await AssertNativeRejection(host, body, response);
+        var document = XDocument.Parse(Encoding.UTF8.GetString(response));
+        Assert.Equal(soapNamespace, document.Root!.Name.NamespaceName);
+        var responseVersion = document.Descendants().Single(e => e.Name.LocalName == "ResponseVersion");
+        Assert.Equal("2", (string?)responseVersion.Attribute("Version"));
+        Assert.Equal("0", (string?)responseVersion.Attribute("MinorVersion"));
+        Assert.Equal("IncompatibleVersion", (string?)responseVersion.Attribute("ErrorCode"));
+        Assert.DoesNotContain(document.Descendants(), e => e.Name.LocalName == "Response");
+        Assert.Empty(await host.Storage.Documents.ListAsync(0, 10));
+        Assert.Equal(0, host.Destination.Reads);
+        Assert.Equal(0, host.Destination.Writes);
+        Assert.False(WakeChannel(host).Reader.TryRead(out _));
+    }
+
+    [Theory]
+    [InlineData(0u)]
+    [InlineData(2u)]
+    [InlineData(65535u)]
+    public async Task SupportedSoapMinorVersionStillExecutes(uint minorVersion)
+    {
+        using var host = new Host();
+        var response = await host.Processor.ProcessCobalt(host.File, Principal(), Soap(
+            "<SubRequest Type=\"WhoAmI\" SubRequestToken=\"1\" />", minorVersion: minorVersion,
+            soapNamespace: "http://www.w3.org/2003/05/soap-envelope"));
+        Assert.Equal("Success", Error(response));
+        var document = XDocument.Parse(Encoding.UTF8.GetString(response));
+        Assert.Equal("http://www.w3.org/2003/05/soap-envelope", document.Root!.Name.NamespaceName);
+        Assert.Equal("3", (string?)document.Descendants().Single(e => e.Name.LocalName == "ResponseVersion").Attribute("MinorVersion"));
+        Assert.Equal(1, host.Destination.Reads);
+    }
+
+    [Theory]
+    [InlineData(1u)]
+    [InlineData(3u)]
+    [InlineData(2u)]
+    public async Task RejectedSoapEnvelopePreservesWarmStateAndPendingPublication(uint version)
+    {
+        using var host = new Host();
+        var query = await host.Query();
+        var client = Guid.NewGuid();
+        Assert.Equal("Success", Error(await host.Processor.ProcessCobalt(host.File, Principal(), Soap($"""
+            <SubRequest Type="EditorsTable" SubRequestToken="1"><SubRequestData EditorsTableRequestType="JoinEditingSession" ClientID="{client:D}" Timeout="3600" AsEditor="true" /></SubRequest>
+            """))));
+        var state = await host.State();
+        // Queue a real accepted revision without invoking the adapter's immediate publisher.
+        var queued = await host.Services.GetRequiredService<CellBridgeDocumentService>().ExecuteAsync(state.Head.ResourceId,
+            DocumentPartitionKind.FileContents, FsshttpbCellRequest.Deserialize(new BinaryReaderEx(await host.PutAsync(query, "pending"u8.ToArray()))),
+            new Dictionary<string, string>(), new(new("wopi:owner", "owner", "owner")));
+        Assert.Single(queued.AcceptedSaves);
+        Assert.True((await host.Lock(WopiEditingLockOperation.Acquire, "held")).Success);
+        state = await host.State();
+        Assert.Equal(1, state.Head.Counters.PendingDeliveries);
+        Assert.NotNull(state.Coordination.HostLock);
+        Assert.NotEmpty(state.Editors);
+        var before = JsonSerializer.Serialize(state);
+        var revisions = JsonSerializer.Serialize(await host.Storage.Documents.ReadRevisionsAsync(state.Head.ResourceId, 0, 100));
+        var pending = JsonSerializer.Serialize(await host.Storage.Documents.ReadNextDeliveryAsync(state.Head.ResourceId));
+        while (WakeChannel(host).Reader.TryRead(out _)) { }
+        var reads = host.Destination.Reads;
+        var response = await host.Processor.ProcessCobalt(host.File, Principal(), Soap($"""
+            <SubRequest Type="EditorsTable" SubRequestToken="1"><SubRequestData EditorsTableRequestType="LeaveEditingSession" ClientID="{client:D}" /></SubRequest>
+            <SubRequest Type="ExclusiveLock" SubRequestToken="2"><SubRequestData ExclusiveLockRequestType="GetLock" ExclusiveLockID="{Guid.NewGuid():D}" ClientID="{client:D}" Timeout="3600" /></SubRequest>
+            {(version == 2 ? "<SubRequest Type=\"WhoAmI\" SubRequestToken=\"3\" DependsOn=\"3\" DependencyType=\"OnSuccess\" />" : "")}
+            """, version: version));
+        Assert.Contains(version == 2 ? "InvalidRequestDependencyType" : "IncompatibleVersion", Encoding.UTF8.GetString(response), StringComparison.Ordinal);
+        Assert.Equal(before, JsonSerializer.Serialize(await host.State()));
+        Assert.Equal(revisions, JsonSerializer.Serialize(await host.Storage.Documents.ReadRevisionsAsync(state.Head.ResourceId, 0, 100)));
+        Assert.Equal(pending, JsonSerializer.Serialize(await host.Storage.Documents.ReadNextDeliveryAsync(state.Head.ResourceId)));
+        Assert.Equal(reads, host.Destination.Reads);
+        Assert.Equal(0, host.Destination.Writes);
+        Assert.Equal("initial", ReadText(host.Destination.Content));
+        Assert.False(WakeChannel(host).Reader.TryRead(out _));
+    }
+
+    [Theory]
+    [InlineData("<SubRequest Type=\"WhoAmI\" SubRequestToken=\"2\"><SubRequestData /></SubRequest>")]
+    [InlineData("<SubRequest Type=\"GetVersions\" SubRequestToken=\"2\"><SubRequestData /></SubRequest>")]
+    [InlineData("<SubRequest Type=\"EditorsTable\" SubRequestToken=\"2\" />")]
+    [InlineData("<SubRequest Type=\"Cell\" SubRequestToken=\"2\"><SubRequestData BinaryDataSize=\"bad\" /></SubRequest>")]
+    public async Task InvalidLaterSoapOperationIsRejectedByParserBeforeImport(string invalidOperation)
+    {
+        using var host = new Host();
+        var body = Soap($"""
+            <SubRequest Type="ExclusiveLock" SubRequestToken="1"><SubRequestData ExclusiveLockRequestType="GetLock" ExclusiveLockID="{Guid.NewGuid():D}" ClientID="{Guid.NewGuid():D}" Timeout="3600" /></SubRequest>
+            {invalidOperation}
+            """);
+        await Assert.ThrowsAsync<InvalidDataException>(() => host.Processor.ProcessCobalt(host.File, Principal(), body));
+        Assert.Empty(await host.Storage.Documents.ListAsync(0, 10));
+        Assert.Equal(0, host.Destination.Reads);
+        Assert.Equal(0, host.Destination.Writes);
+        Assert.False(WakeChannel(host).Reader.TryRead(out _));
+    }
+
+    [Fact]
+    public async Task SelfDependentLaterOperationUsesNativeRejectionBeforeImport()
+    {
+        using var host = new Host();
+        var body = Soap($"""
+            <SubRequest Type="ExclusiveLock" SubRequestToken="1"><SubRequestData ExclusiveLockRequestType="GetLock" ExclusiveLockID="{Guid.NewGuid():D}" ClientID="{Guid.NewGuid():D}" Timeout="3600" /></SubRequest>
+            <SubRequest Type="WhoAmI" SubRequestToken="2" DependsOn="2" DependencyType="OnSuccess" />
+            """);
+        var response = await host.Processor.ProcessCobalt(host.File, Principal(), body);
+        await AssertNativeRejection(host, body, response);
+        Assert.Contains("InvalidRequestDependencyType", Encoding.UTF8.GetString(response), StringComparison.Ordinal);
+        Assert.Empty(await host.Storage.Documents.ListAsync(0, 10));
+        Assert.Equal(0, host.Destination.Reads);
+        Assert.Equal(0, host.Destination.Writes);
+        Assert.False(WakeChannel(host).Reader.TryRead(out _));
+    }
+
+    [Theory]
+    [InlineData(1u)]
+    [InlineData(3u)]
+    public async Task UnsupportedSoapVersionStillRequiresAuthentication(uint version)
+    {
+        using var host = new Host();
+        var body = Soap("<SubRequest Type=\"WhoAmI\" SubRequestToken=\"1\" />", version: version);
+        await Assert.ThrowsAsync<UnauthorizedAccessException>(() => host.Processor.ProcessCobalt(host.File, new ClaimsPrincipal(), body));
+        var crossFile = Soap("<SubRequest Type=\"FileOperation\" SubRequestToken=\"1\"><SubRequestData FileOperation=\"Rename\" NewFileName=\"renamed.docx\" /></SubRequest>",
+            "https://wopi.example.test/wopi/files/other", version: version);
+        var rejected = await host.Processor.ProcessCobalt(host.File, Principal(), crossFile);
+        Assert.Contains("IncompatibleVersion", Encoding.UTF8.GetString(rejected), StringComparison.Ordinal);
+        Assert.Empty(await host.Storage.Documents.ListAsync(0, 10));
+        Assert.Equal(0, host.Destination.Reads);
+    }
+
+    [Fact]
+    public async Task SoapMinorOverflowIsRejectedByParserBeforeImport()
+    {
+        using var host = new Host();
+        await Assert.ThrowsAsync<InvalidDataException>(() => host.Processor.ProcessCobalt(host.File, Principal(), Soap(
+            "<SubRequest Type=\"WhoAmI\" SubRequestToken=\"1\" />", minorVersion: 65536)));
+        Assert.Empty(await host.Storage.Documents.ListAsync(0, 10));
+        Assert.Equal(0, host.Destination.Reads);
+    }
+
+    private static async Task AssertNativeRejection(Host host, byte[] request, byte[] actual)
+    {
+        var expected = await host.Services.GetRequiredService<CellBridgeRequestProcessor>()
+            .ExecuteAsync(CellStorageRequestParser.Parse(Encoding.UTF8.GetString(request)), "https://wopi.example.test",
+                new(new("wopi:owner", "owner", "owner")));
+        Assert.Equal(expected.Response.ToSoapEnvelope(), Encoding.UTF8.GetString(actual));
+    }
+
+    private static Channel<bool> WakeChannel(Host host) => (Channel<bool>)typeof(ExternalRevisionPublicationWorker)
+        .GetField("_wake", BindingFlags.Instance | BindingFlags.NonPublic)!
+        .GetValue(host.Services.GetRequiredService<ExternalRevisionPublicationWorker>())!;
 
     [Fact]
     public async Task StaleUnlockAndDifferentSubjectCannotRemoveReplacementLock()
@@ -321,10 +484,11 @@ public sealed class CoordinatedProcessorTests
     private static byte[] Exclusive() => Soap($"<SubRequest Type=\"ExclusiveLock\" SubRequestToken=\"1\"><SubRequestData ExclusiveLockRequestType=\"GetLock\" ExclusiveLockID=\"{Guid.NewGuid():D}\" ClientID=\"{Guid.NewGuid():D}\" Timeout=\"3600\" /></SubRequest>");
     private static string? Error(byte[] response) => (string?)XDocument.Parse(Encoding.UTF8.GetString(response)).Descendants()
         .Single(e => e.Name.LocalName == "SubResponse").Attribute("ErrorCode");
-    private static byte[] Soap(string subrequest, string url = "https://wopi.example.test/wopi/files/file-1", string attributes = "") => Encoding.UTF8.GetBytes($"""
-        <soap:Envelope xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/"><soap:Body>
+    private static byte[] Soap(string subrequest, string url = "https://wopi.example.test/wopi/files/file-1", string attributes = "",
+        uint version = 2, uint minorVersion = 2, string soapNamespace = "http://schemas.xmlsoap.org/soap/envelope/") => Encoding.UTF8.GetBytes($"""
+        <soap:Envelope xmlns:soap="{soapNamespace}"><soap:Body>
           <ExecuteCellStorageRequest xmlns="http://schemas.microsoft.com/sharepoint/soap/">
-            <RequestVersion Version="2" MinorVersion="2" />
+            <RequestVersion Version="{version}" MinorVersion="{minorVersion}" />
             <RequestCollection CorrelationId="6B29FC40-CA47-1067-B31D-00DD010662DA"><Request Url="{url}" RequestToken="1" {attributes}>{subrequest}</Request></RequestCollection>
           </ExecuteCellStorageRequest>
         </soap:Body></soap:Envelope>
@@ -402,11 +566,16 @@ public sealed class CoordinatedProcessorTests
         private long _version;
         public byte[] Content { get; private set; } = MinimalDocx("initial");
         public int Writes { get; private set; }
+        public int Reads { get; private set; }
         public bool LoseNextAcknowledgement { get; set; }
         public Task<WopiRevisionRead> ReadAsync(string fileId, CancellationToken cancellationToken = default)
         {
-            lock (_gate) return Task.FromResult(new WopiRevisionRead(new MemoryStream(Content.ToArray(), writable: false),
-                "r" + _version, Content.LongLength, Convert.ToHexStringLower(SHA256.HashData(Content))));
+            lock (_gate)
+            {
+                Reads++;
+                return Task.FromResult(new WopiRevisionRead(new MemoryStream(Content.ToArray(), writable: false),
+                    "r" + _version, Content.LongLength, Convert.ToHexStringLower(SHA256.HashData(Content))));
+            }
         }
         public async Task<WopiRevisionWriteResult> CompareExchangeAsync(WopiRevisionWrite request, Stream content, CancellationToken cancellationToken = default)
         {

@@ -59,9 +59,15 @@ public sealed class CoordinatedCellBridgeProcessor : ICobaltProcessor, IWopiCoor
         if (framing == WopiCobaltFraming.Kind.Soap)
         {
             soap = CellStorageRequestParser.Parse(Encoding.UTF8.GetString(newContent));
-            ValidateScope(soap, file, id);
         }
         var actor = await ActorAsync(file, principal, cancellationToken).ConfigureAwait(false);
+        if (soap is not null && CellBridgeSoapAdmission.RequiresRejection(soap))
+        {
+            // A rejected envelope must not import, bind, or drain an existing publication queue.
+            var rejected = await _requests.ExecuteAsync(soap, _options.WebOrigin, actor, cancellationToken).ConfigureAwait(false);
+            return Encoding.UTF8.GetBytes(rejected.Response.ToSoapEnvelope());
+        }
+        if (soap is not null) ValidateScope(soap, file, id);
         var state = await ImportAsync(file, actor, cancellationToken).ConfigureAwait(false);
         actor = actor with { AccessLimit = new(id, actor.AccessLimit!.Access) };
         byte[] response;

@@ -3,6 +3,7 @@ using System.IO.Compression;
 using System.Net;
 using System.Text;
 using System.Text.Json;
+using System.Xml.Linq;
 using CellBridge.AspNetCore;
 using CellBridge.FssHttpB;
 using CellBridge.Storage.Abstractions;
@@ -125,6 +126,47 @@ public sealed class CoordinatedPutFileHttpTests
     }
 
     [Theory]
+    [InlineData(1u, false, "http://schemas.xmlsoap.org/soap/envelope/")]
+    [InlineData(3u, false, "http://www.w3.org/2003/05/soap-envelope")]
+    [InlineData(1u, true, "http://www.w3.org/2003/05/soap-envelope")]
+    [InlineData(3u, true, "http://schemas.xmlsoap.org/soap/envelope/")]
+    public async Task CobaltUnsupportedSoapVersionRejectsBeforeImportOrStateChanges(uint version, bool imported, string soapNamespace)
+    {
+        using var host = await Host.Create();
+        DocumentControlRead? before = null;
+        if (imported)
+        {
+            await host.Lock("held");
+            before = await host.Storage.Documents.ReadControlAsync((await host.Head()).ResourceId);
+        }
+        var reads = host.Destination.ReadCalls;
+        using var response = await host.Cobalt(Soap($"""
+            <SubRequest Type="EditorsTable" SubRequestToken="1"><SubRequestData EditorsTableRequestType="JoinEditingSession" ClientID="{Guid.NewGuid():D}" Timeout="3600" AsEditor="true" /></SubRequest>
+            <SubRequest Type="ExclusiveLock" SubRequestToken="2"><SubRequestData ExclusiveLockRequestType="GetLock" ExclusiveLockID="{Guid.NewGuid():D}" ClientID="{Guid.NewGuid():D}" Timeout="3600" /></SubRequest>
+            """, version, soapNamespace));
+        Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+        var soap = XDocument.Parse(await response.Content.ReadAsStringAsync());
+        Assert.Equal(soapNamespace, soap.Root!.Name.NamespaceName);
+        var responseVersion = soap.Descendants().Single(e => e.Name.LocalName == "ResponseVersion");
+        Assert.Equal("2", (string?)responseVersion.Attribute("Version"));
+        Assert.Equal("0", (string?)responseVersion.Attribute("MinorVersion"));
+        Assert.Equal("IncompatibleVersion", (string?)responseVersion.Attribute("ErrorCode"));
+        Assert.DoesNotContain(soap.Descendants(), e => e.Name.LocalName == "Response");
+        Assert.Equal(reads, host.Destination.ReadCalls);
+        Assert.Equal(0, host.Destination.DirectWrites);
+        Assert.Equal(0, host.Destination.ReceiptCount());
+        if (before is null)
+            Assert.Empty(await host.Storage.Documents.ListAsync(0, 100));
+        else
+        {
+            var after = (await host.Storage.Documents.ReadControlAsync(before.Head.ResourceId))!;
+            Assert.Equal(JsonSerializer.Serialize(before with { UtcNow = default }), JsonSerializer.Serialize(after with { UtcNow = default }));
+            Assert.Single(await host.Revisions());
+        }
+        Assert.Equal(Package("initial"), await host.Read());
+    }
+
+    [Theory]
     [InlineData(false)]
     [InlineData(true)]
     public async Task StaleCobaltLookupDoesNotImportOrReadDestination(bool legacy)
@@ -210,8 +252,9 @@ public sealed class CoordinatedPutFileHttpTests
         Assert.False(host.PutFileCallbacks.CheckFileInfo!.SupportsCoauth);
     }
 
-    private static byte[] Soap(string subRequest) => Encoding.UTF8.GetBytes($"""
-        <soap:Envelope xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/"><soap:Body><ExecuteCellStorageRequest xmlns="http://schemas.microsoft.com/sharepoint/soap/"><RequestVersion Version="2" MinorVersion="2"/><RequestCollection CorrelationId="{Guid.NewGuid():D}"><Request Url="https://wopi.example.test/wopi/files/{SqliteRevisionStore.FileId}" RequestToken="1">{subRequest}</Request></RequestCollection></ExecuteCellStorageRequest></soap:Body></soap:Envelope>
+    private static byte[] Soap(string subRequest, uint version = 2,
+        string soapNamespace = "http://schemas.xmlsoap.org/soap/envelope/") => Encoding.UTF8.GetBytes($"""
+        <soap:Envelope xmlns:soap="{soapNamespace}"><soap:Body><ExecuteCellStorageRequest xmlns="http://schemas.microsoft.com/sharepoint/soap/"><RequestVersion Version="{version}" MinorVersion="2"/><RequestCollection CorrelationId="{Guid.NewGuid():D}"><Request Url="https://wopi.example.test/wopi/files/{SqliteRevisionStore.FileId}" RequestToken="1">{subRequest}</Request></RequestCollection></ExecuteCellStorageRequest></soap:Body></soap:Envelope>
         """);
 
     private sealed class RecordingCobaltProcessor : ICobaltProcessor

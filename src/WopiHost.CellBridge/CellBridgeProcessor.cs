@@ -73,15 +73,25 @@ public sealed partial class CellBridgeProcessor : ICobaltProcessor, IDisposable
         ArgumentNullException.ThrowIfNull(newContent);
 
         var actor = ActorFor(principal);
+        var framing = WopiCobaltFraming.Detect(newContent);
+        var soap = framing == WopiCobaltFraming.Kind.Soap
+            ? CellStorageRequestParser.Parse(Encoding.UTF8.GetString(newContent)) : null;
+        if (soap is not null && CellBridgeSoapAdmission.RequiresRejection(soap))
+        {
+            // Let CellBridge produce its admission rejection before importing or executing any operation.
+            var rejected = await new CellBridgeRequestProcessor(_documents).ExecuteAsync(soap,
+                PublicOrigin(), actor, cancellationToken).ConfigureAwait(false);
+            return Encoding.UTF8.GetBytes(rejected.Response.ToSoapEnvelope());
+        }
         var resourceId = await GetOrImportAsync(file, actor, cancellationToken).ConfigureAwait(false);
         actor = actor with { AccessLimit = new DocumentAccessLimit(resourceId, DocumentAccess.Read | DocumentAccess.Write) };
 
-        switch (WopiCobaltFraming.Detect(newContent))
+        switch (framing)
         {
             case WopiCobaltFraming.Kind.Fsshttpb:
                 return await ExecuteBinaryAsync(file, resourceId, actor, newContent, cancellationToken).ConfigureAwait(false);
             case WopiCobaltFraming.Kind.Soap:
-                return await ExecuteSoapAsync(file, resourceId, actor, newContent, cancellationToken).ConfigureAwait(false);
+                return await ExecuteSoapAsync(file, resourceId, actor, soap!, cancellationToken).ConfigureAwait(false);
             default:
                 LogUnknownFraming(_logger, file.Identifier, Convert.ToHexString(newContent.AsSpan(0, Math.Min(newContent.Length, 16))));
                 throw new NotSupportedException(
@@ -104,9 +114,8 @@ public sealed partial class CellBridgeProcessor : ICobaltProcessor, IDisposable
         return execution.Response.ToByteArray(_options.SerializationProfile);
     }
 
-    private async Task<byte[]> ExecuteSoapAsync(IWopiWritableFile file, Guid resourceId, CellBridgeActor actor, byte[] body, CancellationToken cancellationToken)
+    private async Task<byte[]> ExecuteSoapAsync(IWopiWritableFile file, Guid resourceId, CellBridgeActor actor, CellStorageRequest request, CancellationToken cancellationToken)
     {
-        var request = CellStorageRequestParser.Parse(Encoding.UTF8.GetString(body));
         var response = new CellStorageResponse
         {
             Version = request.Version,
@@ -144,7 +153,7 @@ public sealed partial class CellBridgeProcessor : ICobaltProcessor, IDisposable
                 }
                 else
                 {
-                    await ApplySubRequestAsync(file, resourceId, actor, fileRequest.Url, subRequest, subResponse, cancellationToken).ConfigureAwait(false);
+                    await ApplySubRequestAsync(file, resourceId, actor, request, fileRequest.Url, subRequest, subResponse, cancellationToken).ConfigureAwait(false);
                 }
 
                 fileResponse.SubResponses.Add(subResponse);
@@ -156,7 +165,7 @@ public sealed partial class CellBridgeProcessor : ICobaltProcessor, IDisposable
         return Encoding.UTF8.GetBytes(response.ToSoapEnvelope());
     }
 
-    private async Task ApplySubRequestAsync(IWopiWritableFile file, Guid resourceId, CellBridgeActor actor, string clientUrl, FssHttpSubRequest subRequest, FssHttpSubResponse subResponse, CancellationToken cancellationToken)
+    private async Task ApplySubRequestAsync(IWopiWritableFile file, Guid resourceId, CellBridgeActor actor, CellStorageRequest envelope, string clientUrl, FssHttpSubRequest subRequest, FssHttpSubResponse subResponse, CancellationToken cancellationToken)
     {
         if (subRequest.Type == SubRequestType.GetVersions)
         {
@@ -195,7 +204,12 @@ public sealed partial class CellBridgeProcessor : ICobaltProcessor, IDisposable
             return;
         }
 
-        var request = new CellStorageRequest();
+        var request = new CellStorageRequest
+        {
+            Version = envelope.Version,
+            MinorVersion = envelope.MinorVersion,
+            SoapNamespace = envelope.SoapNamespace,
+        };
         var fileRequest = new FssHttpRequest { Url = clientUrl, UseResourceId = true, ResourceId = resourceId.ToString("D") };
         // The outer loop evaluated dependencies against all earlier operations. Delegate the
         // admitted operation without asking CellBridge to resolve a partial dependency list.

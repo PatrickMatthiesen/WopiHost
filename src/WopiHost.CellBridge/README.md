@@ -43,6 +43,8 @@ SOAP supports `EditorsTable`, `GetDocMetaInfo` and `GetVersions` alongside Cell 
 
 Set `WebOrigin` to the public HTTP(S) origin for SOAP requests, or leave it empty to use the current request's scheme and host through the automatically registered `IHttpContextAccessor`. SOAP file URLs are echoed in responses, and every operation targets the file selected by the WOPI route.
 
+Both adapters validate the original SOAP envelope before importing or publishing documents. Unsupported major versions receive CellBridge's `IncompatibleVersion` response. Invalid envelope structure also fails before any subrequest executes.
+
 Register only one editing backend. For persistent editing state and shared WOPI and CellBridge locks, use the coordinated setup below.
 
 ## Coordinated setup
